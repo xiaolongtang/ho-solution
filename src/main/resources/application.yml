@@ -1,0 +1,35 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:h2:./data/h2db;MODE=Oracle;DATABASE_TO_UPPER=false;AUTO_SERVER=TRUE
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+
+oracle:
+  url: jdbc:oracle:thin:@//YOUR_ORACLE_HOST:1521/YOUR_SERVICE
+  username: YOUR_ORACLE_USER
+  password: YOUR_ORACLE_PASSWORD
+  schema: YOUR_ORACLE_SCHEMA
+
+loader:
+  enabled: true
+  cron: "0 30 2 * * *"
+  threads: 4
+  batchSize: 1000
+  maxRetries: 3
+  blacklist: ["AUDIT_LOG","SOME_BIG_TABLE_TO_SKIP"]
+
+h2:
+  tcp:
+    port: 9092
+    allow-others: true
+    web-console: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics

@@ -1,0 +1,393 @@
+package com.example.h2sync.service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.stereotype.Service;
+
+import javax.sql.DataSource;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+@Service
+public class OracleLoaderService {
+    private static final Logger log = LoggerFactory.getLogger(OracleLoaderService.class);
+
+    private final JdbcTemplate h2;
+    private final DataSource oracleDs;
+    private final int threads;
+    private final int batchSize;
+    private final int maxRetries;
+    private final Set<String> blacklist;
+    private final String oracleSchema;
+
+    public OracleLoaderService(
+            JdbcTemplate h2,
+            @Value("${oracle.url}") String url,
+            @Value("${oracle.username}") String user,
+            @Value("${oracle.password}") String pass,
+            @Value("${oracle.schema}") String schema,
+            @Value("${loader.threads:4}") int threads,
+            @Value("${loader.batchSize:1000}") int batchSize,
+            @Value("${loader.maxRetries:3}") int maxRetries,
+            @Value("#{'${loader.blacklist:}'.replace('[','').replace(']','')}") String blacklistCsv
+    ) {
+        this.h2 = h2;
+        this.threads = threads;
+        this.batchSize = batchSize;
+        this.maxRetries = maxRetries;
+        this.oracleSchema = schema != null ? schema.toUpperCase(Locale.ROOT) : null;
+
+        DriverManagerDataSource ds = new DriverManagerDataSource();
+        ds.setDriverClassName("oracle.jdbc.OracleDriver");
+        ds.setUrl(url);
+        ds.setUsername(user);
+        ds.setPassword(pass);
+        this.oracleDs = ds;
+
+        this.blacklist = Arrays.stream(blacklistCsv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(s -> s.toUpperCase(Locale.ROOT))
+                .collect(Collectors.toSet());
+
+        initFailLogTable();
+    }
+
+    private void initFailLogTable() {
+        String create = "CREATE TABLE IF NOT EXISTS ETL_FAIL_LOG (" +
+                "ID IDENTITY PRIMARY KEY," +
+                "OBJECT_TYPE VARCHAR(32) NOT NULL," +
+                "OBJECT_NAME VARCHAR(256) NOT NULL," +
+                "ATTEMPT_COUNT INT NOT NULL," +
+                "LAST_ATTEMPT TIMESTAMP NOT NULL," +
+                "ERROR_MESSAGE CLOB," +
+                "CONSTRAINT UQ_OBJ UNIQUE (OBJECT_TYPE, OBJECT_NAME)" +
+                ")";
+        h2.execute(create);
+    }
+
+    public void runFullRefresh() {
+        log.info("Starting Oracle -> H2 full refresh. threads={}, batchSize={}, schema={}, blacklist={}",
+                threads, batchSize, oracleSchema, blacklist);
+        long t0 = System.currentTimeMillis();
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        List<Future<?>> futures = new ArrayList<>();
+
+        try (Connection oconn = oracleDs.getConnection()) {
+            Set<String> tables = listTables(oconn);
+            Set<String> views = listViews(oconn);
+            List<Map<String, Object>> sequences = listSequences(oconn);
+
+            for (String t : tables) {
+                if (isBlacklisted(t)) continue;
+                futures.add(pool.submit(() -> retry(() -> copyTable(oconn, t), "TABLE", t)));
+            }
+            for (String v : views) {
+                if (isBlacklisted(v)) continue;
+                futures.add(pool.submit(() -> retry(() -> copyViewAsTable(oconn, v), "VIEW", v)));
+            }
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting for Oracle tasks", ie);
+                } catch (ExecutionException ee) {
+                    // retry() already recorded the failure and rethrew, so nothing more to do here.
+                }
+            }
+            futures.clear();
+
+            for (Map<String, Object> seq : sequences) {
+                String name = (String) seq.get("SEQUENCE_NAME");
+                if (isBlacklisted(name)) continue;
+                retry(() -> syncSequence(seq), "SEQUENCE", name);
+            }
+        } catch (SQLException e) {
+            log.error("Oracle connection failure", e);
+            throw new RuntimeException(e);
+        } finally {
+            pool.shutdown();
+        }
+        long took = System.currentTimeMillis() - t0;
+        log.info("Full refresh completed in {} ms", took);
+    }
+
+    private boolean isBlacklisted(String name) {
+        String n = name.toUpperCase(Locale.ROOT);
+        if (blacklist.contains(n)) return true;
+        if (oracleSchema != null && blacklist.contains(oracleSchema + "." + n)) return true;
+        return false;
+    }
+
+    private void retry(Runnable task, String type, String name) {
+        int attempt = 0;
+        while (true) {
+            try {
+                attempt++;
+                task.run();
+                recordSuccess(type, name);
+                return;
+            } catch (Exception ex) {
+                log.warn("Failed to process {} {} on attempt {}: {}", type, name, attempt, ex.toString());
+                if (attempt >= maxRetries) {
+                    recordFailure(type, name, attempt, ex);
+                    throw ex instanceof RuntimeException ? (RuntimeException) ex : new RuntimeException(ex);
+                }
+                try {
+                    Thread.sleep(1000L * attempt * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    private void recordSuccess(String type, String name) {
+        String sql = "MERGE INTO ETL_FAIL_LOG (OBJECT_TYPE, OBJECT_NAME, ATTEMPT_COUNT, LAST_ATTEMPT, ERROR_MESSAGE) " +
+                "KEY (OBJECT_TYPE, OBJECT_NAME) VALUES (?, ?, 0, CURRENT_TIMESTAMP(), NULL)";
+        h2.update(sql, type, name);
+    }
+
+    private void recordFailure(String type, String name, int attempt, Exception ex) {
+        String sql = "MERGE INTO ETL_FAIL_LOG (OBJECT_TYPE, OBJECT_NAME, ATTEMPT_COUNT, LAST_ATTEMPT, ERROR_MESSAGE) " +
+                "KEY (OBJECT_TYPE, OBJECT_NAME) VALUES (?, ?, ?, CURRENT_TIMESTAMP(), ?)";
+        h2.update(sql, type, name, attempt, truncate(exToString(ex), 16000));
+    }
+
+    private String truncate(String s, int max) {
+        if (s == null) return null;
+        return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    private String exToString(Exception e) {
+        StringBuilder sb = new StringBuilder(e.toString()).append("\n");
+        for (StackTraceElement el : e.getStackTrace()) {
+            sb.append("  at ").append(el.toString()).append("\n");
+        }
+        return sb.toString();
+    }
+
+    private Set<String> listTables(Connection conn) throws SQLException {
+        String sql = "SELECT table_name FROM all_tables WHERE owner = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            try (ResultSet rs = ps.executeQuery()) {
+                Set<String> out = new TreeSet<>();
+                while (rs.next()) out.add(rs.getString(1));
+                log.info("Found {} tables in Oracle schema {}", out.size(), oracleSchema);
+                return out;
+            }
+        }
+    }
+
+    private Set<String> listViews(Connection conn) throws SQLException {
+        String sql = "SELECT view_name FROM all_views WHERE owner = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            try (ResultSet rs = ps.executeQuery()) {
+                Set<String> out = new TreeSet<>();
+                while (rs.next()) out.add(rs.getString(1));
+                log.info("Found {} views in Oracle schema {}", out.size(), oracleSchema);
+                return out;
+            }
+        }
+    }
+
+    private List<Map<String, Object>> listSequences(Connection conn) throws SQLException {
+        String sql = "SELECT sequence_name, increment_by, last_number FROM all_sequences WHERE sequence_owner = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<Map<String, Object>> out = new ArrayList<>();
+                while (rs.next()) {
+                    Map<String, Object> row = new HashMap<>();
+                    row.put("SEQUENCE_NAME", rs.getString("SEQUENCE_NAME"));
+                    row.put("INCREMENT_BY", rs.getLong("INCREMENT_BY"));
+                    row.put("LAST_NUMBER", rs.getBigDecimal("LAST_NUMBER"));
+                    out.add(row);
+                }
+                log.info("Found {} sequences in Oracle schema {}", out.size(), oracleSchema);
+                return out;
+            }
+        }
+    }
+
+    private void syncSequence(Map<String, Object> seq) {
+        String name = ((String) seq.get("SEQUENCE_NAME")).toUpperCase(Locale.ROOT);
+        long increment = ((Number) seq.get("INCREMENT_BY")).longValue();
+        java.math.BigDecimal lastNumber = (java.math.BigDecimal) seq.get("LAST_NUMBER");
+        String drop = "DROP SEQUENCE IF EXISTS \"" + name + "\"";
+        String create = "CREATE SEQUENCE IF NOT EXISTS \"" + name + "\" START WITH " + lastNumber.toPlainString() + " INCREMENT BY " + increment;
+        String alter = "ALTER SEQUENCE \"" + name + "\" RESTART WITH " + lastNumber.toPlainString();
+        h2.execute(drop);
+        h2.execute(create);
+        h2.execute(alter);
+        log.info("Synced sequence {} startWith={}", name, lastNumber);
+    }
+
+    private void copyTable(Connection oconn, String table) {
+        String src = oracleSchema + "." + table;
+        String tgt = "\"" + table + "\"";
+        log.info("Copying table {}", src);
+        try (Statement s = oconn.createStatement()) {
+            try (ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
+                createTargetTableFrom(rs.getMetaData(), tgt);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Prepare target table failed for " + src, e);
+        }
+        bulkInsertFromSelect(oconn, "SELECT * FROM " + src, tgt);
+    }
+
+    private void copyViewAsTable(Connection oconn, String view) {
+        String src = oracleSchema + "." + view;
+        String tgt = "\"VW_" + view + "\"";
+        log.info("Materializing view {} into {}", src, tgt);
+        try (Statement s = oconn.createStatement()) {
+            try (ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
+                createTargetTableFrom(rs.getMetaData(), tgt);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Prepare target table failed for view " + src, e);
+        }
+        bulkInsertFromSelect(oconn, "SELECT * FROM " + src, tgt);
+    }
+
+    private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
+        String drop = "DROP TABLE IF EXISTS " + target;
+        h2.execute(drop);
+        StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(target).append(" (");
+        for (int i = 1; i <= md.getColumnCount(); i++) {
+            if (i > 1) ddl.append(", ");
+            String name = md.getColumnName(i);
+            int type = md.getColumnType(i);
+            int precision = md.getPrecision(i);
+            int scale = md.getScale(i);
+            ddl.append("\"").append(name).append("\" ").append(mapType(type, precision, scale));
+        }
+        ddl.append(")");
+        h2.execute(ddl.toString());
+    }
+
+    private String mapType(int jdbcType, int precision, int scale) {
+        switch (jdbcType) {
+            case Types.INTEGER:
+            case Types.SMALLINT:
+            case Types.TINYINT:
+                return "INTEGER";
+            case Types.BIGINT:
+                return "BIGINT";
+            case Types.DECIMAL:
+            case Types.NUMERIC:
+                if (scale == 0) {
+                    if (precision <= 9) return "INTEGER";
+                    if (precision <= 18) return "BIGINT";
+                }
+                int p = Math.min(precision == 0 ? 38 : precision, 38);
+                int s = Math.max(0, Math.min(scale, 12));
+                return "DECIMAL(" + p + "," + s + ")";
+            case Types.FLOAT:
+            case Types.REAL:
+            case Types.DOUBLE:
+                return "DOUBLE";
+            case Types.DATE:
+            case Types.TIME:
+            case Types.TIMESTAMP:
+            case Types.TIMESTAMP_WITH_TIMEZONE:
+                return "TIMESTAMP";
+            case Types.BOOLEAN:
+            case Types.BIT:
+                return "BOOLEAN";
+            case Types.BLOB:
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY:
+                return "BLOB";
+            case Types.CLOB:
+            case Types.NCLOB:
+            case Types.LONGVARCHAR:
+            case Types.LONGNVARCHAR:
+                return "CLOB";
+            case Types.NCHAR:
+            case Types.NVARCHAR:
+            case Types.CHAR:
+            case Types.VARCHAR:
+            default:
+                int len = precision > 0 ? precision : 255;
+                len = Math.min(len, 10000);
+                return "VARCHAR(" + len + ")";
+        }
+    }
+
+    private void bulkInsertFromSelect(Connection oconn, String selectSql, String target) {
+        String countSql = "SELECT COUNT(1) FROM (" + selectSql + ") t";
+        long total = 0;
+        try (Statement st = oconn.createStatement();
+             ResultSet crs = st.executeQuery(countSql)) {
+            if (crs.next()) total = crs.getLong(1);
+        } catch (SQLException e) {
+            log.warn("Count failed (non-fatal) for {}: {}", selectSql, e.getMessage());
+        }
+
+        try (PreparedStatement src = oconn.prepareStatement(selectSql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
+            src.setFetchSize(Math.max(batchSize, 100));
+            try (ResultSet rs = src.executeQuery()) {
+                ResultSetMetaData md = rs.getMetaData();
+                int cols = md.getColumnCount();
+                StringBuilder sb = new StringBuilder("INSERT INTO ").append(target).append(" (");
+                for (int i = 1; i <= cols; i++) {
+                    if (i > 1) sb.append(",");
+                    sb.append("\"").append(md.getColumnName(i)).append("\"");
+                }
+                sb.append(") VALUES (");
+                for (int i = 1; i <= cols; i++) {
+                    if (i > 1) sb.append(",");
+                    sb.append("?");
+                }
+                sb.append(")");
+                String insertSql = sb.toString();
+
+                try (Connection h2conn = Objects.requireNonNull(h2.getDataSource()).getConnection()) {
+                    h2conn.setAutoCommit(false);
+                    try (PreparedStatement ins = h2conn.prepareStatement(insertSql)) {
+                        long n = 0;
+                        while (rs.next()) {
+                            for (int i = 1; i <= cols; i++) {
+                                Object v = rs.getObject(i);
+                                ins.setObject(i, v);
+                            }
+                            ins.addBatch();
+                            n++;
+                            if (n % batchSize == 0) {
+                                ins.executeBatch();
+                                h2conn.commit();
+                                if (total > 0) {
+                                    log.info("Inserted {} / {} into {}", n, total, target);
+                                } else if (n % (batchSize * 10) == 0) {
+                                    log.info("Inserted {} rows into {}", n, target);
+                                }
+                            }
+                        }
+                        ins.executeBatch();
+                        h2conn.commit();
+                        log.info("Inserted {} rows into {}", n, target);
+                    } catch (SQLException ex) {
+                        h2conn.rollback();
+                        throw ex;
+                    } finally {
+                        h2conn.setAutoCommit(true);
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Bulk insert failed for target " + target, e);
+        }
+    }
+}
