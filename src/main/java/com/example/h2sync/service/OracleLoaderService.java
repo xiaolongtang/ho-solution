@@ -27,6 +27,7 @@ public class OracleLoaderService {
 
     public OracleLoaderService(
             JdbcTemplate h2,
+            @Value("${oracle.driver-class:oracle.jdbc.OracleDriver}") String driverClass,
             @Value("${oracle.url}") String url,
             @Value("${oracle.username}") String user,
             @Value("${oracle.password}") String pass,
@@ -36,26 +37,41 @@ public class OracleLoaderService {
             @Value("${loader.maxRetries:3}") int maxRetries,
             @Value("#{'${loader.blacklist:}'.replace('[','').replace(']','')}") String blacklistCsv
     ) {
+        this(h2, createOracleDataSource(driverClass, url, user, pass), schema, threads, batchSize, maxRetries, blacklistCsv);
+    }
+
+    OracleLoaderService(
+            JdbcTemplate h2,
+            DataSource oracleDs,
+            String schema,
+            int threads,
+            int batchSize,
+            int maxRetries,
+            String blacklistCsv
+    ) {
         this.h2 = h2;
+        this.oracleDs = oracleDs;
         this.threads = threads;
         this.batchSize = batchSize;
         this.maxRetries = maxRetries;
         this.oracleSchema = schema != null ? schema.toUpperCase(Locale.ROOT) : null;
 
-        DriverManagerDataSource ds = new DriverManagerDataSource();
-        ds.setDriverClassName("oracle.jdbc.OracleDriver");
-        ds.setUrl(url);
-        ds.setUsername(user);
-        ds.setPassword(pass);
-        this.oracleDs = ds;
-
-        this.blacklist = Arrays.stream(blacklistCsv.split(","))
+        this.blacklist = Arrays.stream((blacklistCsv == null ? "" : blacklistCsv).split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .map(s -> s.toUpperCase(Locale.ROOT))
                 .collect(Collectors.toSet());
 
         initFailLogTable();
+    }
+
+    private static DataSource createOracleDataSource(String driverClass, String url, String user, String pass) {
+        DriverManagerDataSource ds = new DriverManagerDataSource();
+        ds.setDriverClassName(driverClass != null && !driverClass.isBlank() ? driverClass : "oracle.jdbc.OracleDriver");
+        ds.setUrl(url);
+        ds.setUsername(user);
+        ds.setPassword(pass);
+        return ds;
     }
 
     private void initFailLogTable() {
@@ -79,18 +95,26 @@ public class OracleLoaderService {
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         List<Future<?>> futures = new ArrayList<>();
 
-        try (Connection oconn = oracleDs.getConnection()) {
-            Set<String> tables = listTables(oconn);
-            Set<String> views = listViews(oconn);
-            List<Map<String, Object>> sequences = listSequences(oconn);
+        Set<String> tables;
+        Set<String> views;
+        List<Map<String, Object>> sequences;
+        try (Connection metadataConn = oracleDs.getConnection()) {
+            tables = listTables(metadataConn);
+            views = listViews(metadataConn);
+            sequences = listSequences(metadataConn);
+        } catch (SQLException e) {
+            log.error("Oracle connection failure", e);
+            throw new RuntimeException(e);
+        }
 
+        try {
             for (String t : tables) {
                 if (isBlacklisted(t)) continue;
-                futures.add(pool.submit(() -> retry(() -> copyTable(oconn, t), "TABLE", t)));
+                futures.add(pool.submit(() -> retry(() -> copyTable(t), "TABLE", t)));
             }
             for (String v : views) {
                 if (isBlacklisted(v)) continue;
-                futures.add(pool.submit(() -> retry(() -> copyViewAsTable(oconn, v), "VIEW", v)));
+                futures.add(pool.submit(() -> retry(() -> copyViewAsTable(v), "VIEW", v)));
             }
             for (Future<?> f : futures) {
                 try {
@@ -109,9 +133,6 @@ public class OracleLoaderService {
                 if (isBlacklisted(name)) continue;
                 retry(() -> syncSequence(seq), "SEQUENCE", name);
             }
-        } catch (SQLException e) {
-            log.error("Oracle connection failure", e);
-            throw new RuntimeException(e);
         } finally {
             pool.shutdown();
         }
@@ -232,32 +253,34 @@ public class OracleLoaderService {
         log.info("Synced sequence {} startWith={}", name, lastNumber);
     }
 
-    private void copyTable(Connection oconn, String table) {
+    private void copyTable(String table) {
         String src = oracleSchema + "." + table;
         String tgt = "\"" + table + "\"";
         log.info("Copying table {}", src);
-        try (Statement s = oconn.createStatement()) {
-            try (ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
-                createTargetTableFrom(rs.getMetaData(), tgt);
-            }
+        try (Connection oconn = oracleDs.getConnection();
+             Statement s = oconn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
+            log.debug("Prepared metadata for {} using Oracle connection {}", src, oconn);
+            createTargetTableFrom(rs.getMetaData(), tgt);
         } catch (SQLException e) {
             throw new RuntimeException("Prepare target table failed for " + src, e);
         }
-        bulkInsertFromSelect(oconn, "SELECT * FROM " + src, tgt);
+        bulkInsertFromSelect("SELECT * FROM " + src, tgt);
     }
 
-    private void copyViewAsTable(Connection oconn, String view) {
+    private void copyViewAsTable(String view) {
         String src = oracleSchema + "." + view;
         String tgt = "\"VW_" + view + "\"";
         log.info("Materializing view {} into {}", src, tgt);
-        try (Statement s = oconn.createStatement()) {
-            try (ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
-                createTargetTableFrom(rs.getMetaData(), tgt);
-            }
+        try (Connection oconn = oracleDs.getConnection();
+             Statement s = oconn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
+            log.debug("Prepared metadata for view {} using Oracle connection {}", src, oconn);
+            createTargetTableFrom(rs.getMetaData(), tgt);
         } catch (SQLException e) {
             throw new RuntimeException("Prepare target table failed for view " + src, e);
         }
-        bulkInsertFromSelect(oconn, "SELECT * FROM " + src, tgt);
+        bulkInsertFromSelect("SELECT * FROM " + src, tgt);
     }
 
     private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
@@ -326,63 +349,66 @@ public class OracleLoaderService {
         }
     }
 
-    private void bulkInsertFromSelect(Connection oconn, String selectSql, String target) {
+    private void bulkInsertFromSelect(String selectSql, String target) {
         String countSql = "SELECT COUNT(1) FROM (" + selectSql + ") t";
         long total = 0;
-        try (Statement st = oconn.createStatement();
-             ResultSet crs = st.executeQuery(countSql)) {
-            if (crs.next()) total = crs.getLong(1);
-        } catch (SQLException e) {
-            log.warn("Count failed (non-fatal) for {}: {}", selectSql, e.getMessage());
-        }
+        try (Connection oconn = oracleDs.getConnection()) {
+            try (Statement st = oconn.createStatement();
+                 ResultSet crs = st.executeQuery(countSql)) {
+                if (crs.next()) total = crs.getLong(1);
+            } catch (SQLException e) {
+                log.warn("Count failed (non-fatal) for {}: {}", selectSql, e.getMessage());
+            }
 
-        try (PreparedStatement src = oconn.prepareStatement(selectSql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-            src.setFetchSize(Math.max(batchSize, 100));
-            try (ResultSet rs = src.executeQuery()) {
-                ResultSetMetaData md = rs.getMetaData();
-                int cols = md.getColumnCount();
-                StringBuilder sb = new StringBuilder("INSERT INTO ").append(target).append(" (");
-                for (int i = 1; i <= cols; i++) {
-                    if (i > 1) sb.append(",");
-                    sb.append("\"").append(md.getColumnName(i)).append("\"");
-                }
-                sb.append(") VALUES (");
-                for (int i = 1; i <= cols; i++) {
-                    if (i > 1) sb.append(",");
-                    sb.append("?");
-                }
-                sb.append(")");
-                String insertSql = sb.toString();
+            try (PreparedStatement src = oconn.prepareStatement(selectSql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
+                log.debug("Streaming data for target {} using Oracle connection {}", target, oconn);
+                src.setFetchSize(Math.max(batchSize, 100));
+                try (ResultSet rs = src.executeQuery()) {
+                    ResultSetMetaData md = rs.getMetaData();
+                    int cols = md.getColumnCount();
+                    StringBuilder sb = new StringBuilder("INSERT INTO ").append(target).append(" (");
+                    for (int i = 1; i <= cols; i++) {
+                        if (i > 1) sb.append(",");
+                        sb.append("\"").append(md.getColumnName(i)).append("\"");
+                    }
+                    sb.append(") VALUES (");
+                    for (int i = 1; i <= cols; i++) {
+                        if (i > 1) sb.append(",");
+                        sb.append("?");
+                    }
+                    sb.append(")");
+                    String insertSql = sb.toString();
 
-                try (Connection h2conn = Objects.requireNonNull(h2.getDataSource()).getConnection()) {
-                    h2conn.setAutoCommit(false);
-                    try (PreparedStatement ins = h2conn.prepareStatement(insertSql)) {
-                        long n = 0;
-                        while (rs.next()) {
-                            for (int i = 1; i <= cols; i++) {
-                                Object v = rs.getObject(i);
-                                ins.setObject(i, v);
-                            }
-                            ins.addBatch();
-                            n++;
-                            if (n % batchSize == 0) {
-                                ins.executeBatch();
-                                h2conn.commit();
-                                if (total > 0) {
-                                    log.info("Inserted {} / {} into {}", n, total, target);
-                                } else if (n % (batchSize * 10) == 0) {
-                                    log.info("Inserted {} rows into {}", n, target);
+                    try (Connection h2conn = Objects.requireNonNull(h2.getDataSource()).getConnection()) {
+                        h2conn.setAutoCommit(false);
+                        try (PreparedStatement ins = h2conn.prepareStatement(insertSql)) {
+                            long n = 0;
+                            while (rs.next()) {
+                                for (int i = 1; i <= cols; i++) {
+                                    Object v = rs.getObject(i);
+                                    ins.setObject(i, v);
+                                }
+                                ins.addBatch();
+                                n++;
+                                if (n % batchSize == 0) {
+                                    ins.executeBatch();
+                                    h2conn.commit();
+                                    if (total > 0) {
+                                        log.info("Inserted {} / {} into {}", n, total, target);
+                                    } else if (n % (batchSize * 10) == 0) {
+                                        log.info("Inserted {} rows into {}", n, target);
+                                    }
                                 }
                             }
+                            ins.executeBatch();
+                            h2conn.commit();
+                            log.info("Inserted {} rows into {}", n, target);
+                        } catch (SQLException ex) {
+                            h2conn.rollback();
+                            throw ex;
+                        } finally {
+                            h2conn.setAutoCommit(true);
                         }
-                        ins.executeBatch();
-                        h2conn.commit();
-                        log.info("Inserted {} rows into {}", n, target);
-                    } catch (SQLException ex) {
-                        h2conn.rollback();
-                        throw ex;
-                    } finally {
-                        h2conn.setAutoCommit(true);
                     }
                 }
             }
