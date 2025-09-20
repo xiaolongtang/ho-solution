@@ -63,6 +63,7 @@ http://localhost:8080/swagger-ui/index.html
 Response is `text/plain`, one row per line, columns joined by comma (quoted as needed). Only a **single SELECT** is allowed—no `;`, no DDL/DML.
 
 ### Daily Loader (Oracle → H2)
+- **Startup refresh**: automatically runs a full refresh once the application is ready, before the cron schedule kicks in.
 - **Tables**: dropped and recreated from Oracle column metadata, then bulk-inserted (batched, streaming).
 - **Views**: **materialized** into tables named `VW_<VIEWNAME>`.
 - **Sequences**: recreated in H2 using Oracle `INCREMENT BY` and **current/next** value (`last_number`).
@@ -70,6 +71,10 @@ Response is `text/plain`, one row per line, columns joined by comma (quoted as n
 - **Multithreaded**: parallel copy per table/view (`loader.threads`).
 - **Retries**: each object retried up to `loader.maxRetries` with exponential backoff.
 - **Failure log**: H2 table `ETL_FAIL_LOG` records failures for manual compensation.
+
+### Manual Full Refresh
+- `POST /api/loader/full-refresh?reason=<optional>` runs the full loader on demand without restarting Spring Boot.
+- The request blocks until the refresh finishes and returns `200 OK` on success, `409 CONFLICT` if another refresh is running, `503` when the loader is disabled.
 
 Schedule defaults to **02:30 Asia/Tokyo** daily. Adjust with `loader.cron` (Spring cron).
 
@@ -138,6 +143,7 @@ Swagger：`http://localhost:8080/swagger-ui/index.html`
 返回 `text/plain`，**一行一条**，**列用逗号分隔**（必要时会加引号）。**只允许单条 SELECT**，禁止 `;` 与任何 DDL/DML。
 
 ### 每日装载（Oracle → H2）
+- **启动即刷新**：Spring Boot 完全就绪后会立即执行一次全量刷新，然后再按 cron 定时。
 - **表**：根据 Oracle 列元数据在 H2 里**重建表结构**，然后批量写入（流式 + 批处理）。
 - **视图**：在 H2 中**物化为表**，命名为 `VW_<VIEWNAME>`。
 - **序列**：用 Oracle 的 `INCREMENT BY` 和 **当前/下一个值**（`last_number`）在 H2 里重建。
@@ -145,6 +151,10 @@ Swagger：`http://localhost:8080/swagger-ui/index.html`
 - **多线程**：按表/视图并行（`loader.threads`）。
 - **重试**：每个对象最多重试 `loader.maxRetries` 次，指数退避。
 - **失败记录**：H2 表 `ETL_FAIL_LOG` 记录失败，便于人工补偿。
+
+### 手动触发全量
+- `POST /api/loader/full-refresh?reason=<可选说明>` 可以在不重启 Spring Boot 的情况下随时触发全量。
+- 接口会在全量完成后返回：成功 `200 OK`，若已有任务在跑返回 `409 CONFLICT`，若 loader 被禁用则返回 `503`。
 
 默认每天 **东京时间 02:30** 执行，修改 `loader.cron` 可调整。
 
