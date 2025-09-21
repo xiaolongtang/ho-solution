@@ -19,6 +19,7 @@ import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Service
@@ -30,7 +31,9 @@ public class OracleLoaderService {
     private final int threads;
     private final int batchSize;
     private final int maxRetries;
-    private final Set<String> blacklist;
+    private final List<String> blacklistEntries;
+    private final Set<String> blacklistExact;
+    private final List<Pattern> blacklistPatterns;
     private final String oracleSchema;
 
     @Autowired
@@ -65,11 +68,25 @@ public class OracleLoaderService {
         this.maxRetries = maxRetries;
         this.oracleSchema = schema != null ? schema.toUpperCase(Locale.ROOT) : null;
 
-        this.blacklist = Arrays.stream((blacklistCsv == null ? "" : blacklistCsv).split(","))
+        List<String> tokens = Arrays.stream((blacklistCsv == null ? "" : blacklistCsv).split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .map(s -> s.toUpperCase(Locale.ROOT))
-                .collect(Collectors.toSet());
+                .collect(Collectors.toList());
+
+        Set<String> exact = new LinkedHashSet<>();
+        List<Pattern> patterns = new ArrayList<>();
+        for (String token : tokens) {
+            if (hasWildcard(token)) {
+                patterns.add(compileGlob(token));
+            } else {
+                exact.add(token);
+            }
+        }
+
+        this.blacklistEntries = Collections.unmodifiableList(tokens);
+        this.blacklistExact = Collections.unmodifiableSet(exact);
+        this.blacklistPatterns = Collections.unmodifiableList(patterns);
 
         initFailLogTable();
     }
@@ -98,7 +115,7 @@ public class OracleLoaderService {
 
     public void runFullRefresh() {
         log.info("Starting Oracle -> H2 full refresh. threads={}, batchSize={}, schema={}, blacklist={}",
-                threads, batchSize, oracleSchema, blacklist);
+                threads, batchSize, oracleSchema, blacklistEntries);
         long t0 = System.currentTimeMillis();
 
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -151,9 +168,60 @@ public class OracleLoaderService {
 
     private boolean isBlacklisted(String name) {
         String n = name.toUpperCase(Locale.ROOT);
-        if (blacklist.contains(n)) return true;
-        if (oracleSchema != null && blacklist.contains(oracleSchema + "." + n)) return true;
+        if (blacklistExact.contains(n) || matchesPattern(n)) return true;
+        if (oracleSchema != null) {
+            String qualified = oracleSchema + "." + n;
+            if (blacklistExact.contains(qualified) || matchesPattern(qualified)) return true;
+        }
         return false;
+    }
+
+    private boolean matchesPattern(String value) {
+        for (Pattern pattern : blacklistPatterns) {
+            if (pattern.matcher(value).matches()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasWildcard(String token) {
+        return token.indexOf('*') >= 0 || token.indexOf('?') >= 0 || token.indexOf('%') >= 0;
+    }
+
+    private Pattern compileGlob(String token) {
+        StringBuilder regex = new StringBuilder();
+        regex.append('^');
+        for (int i = 0; i < token.length(); i++) {
+            char c = token.charAt(i);
+            switch (c) {
+                case '*':
+                case '%':
+                    regex.append(".*");
+                    break;
+                case '?':
+                    regex.append('.');
+                    break;
+                case '\\':
+                case '.':
+                case '^':
+                case '$':
+                case '+':
+                case '{':
+                case '}':
+                case '[':
+                case ']':
+                case '|':
+                case '(': 
+                case ')':
+                    regex.append('\\').append(c);
+                    break;
+                default:
+                    regex.append(c);
+            }
+        }
+        regex.append('$');
+        return Pattern.compile(regex.toString());
     }
 
     private void retry(Runnable task, String type, String name) {
@@ -436,6 +504,17 @@ public class OracleLoaderService {
 
     private Object readColumnValue(ResultSet rs, ResultSetMetaData md, int index) throws SQLException {
         int jdbcType = md.getColumnType(index);
+
+        if (isBinaryType(jdbcType)) {
+            byte[] data = rs.getBytes(index);
+            return rs.wasNull() ? null : data;
+        }
+
+        if (isClobType(jdbcType)) {
+            String text = rs.getString(index);
+            return rs.wasNull() ? null : text;
+        }
+
         if (isTemporalType(jdbcType)) {
             try {
                 Timestamp ts = rs.getTimestamp(index);
@@ -448,6 +527,14 @@ public class OracleLoaderService {
         }
 
         Object value = rs.getObject(index);
+
+        if (value instanceof Blob) {
+            return blobToBytes((Blob) value);
+        }
+        if (value instanceof Clob) {
+            return clobToString((Clob) value);
+        }
+
         if (isTemporalType(jdbcType)) {
             return toTimestamp(value);
         }
@@ -460,6 +547,20 @@ public class OracleLoaderService {
                 || jdbcType == Types.TIMESTAMP
                 || jdbcType == Types.TIMESTAMP_WITH_TIMEZONE
                 || jdbcType == Types.TIME_WITH_TIMEZONE;
+    }
+
+    private boolean isBinaryType(int jdbcType) {
+        return jdbcType == Types.BLOB
+                || jdbcType == Types.BINARY
+                || jdbcType == Types.VARBINARY
+                || jdbcType == Types.LONGVARBINARY;
+    }
+
+    private boolean isClobType(int jdbcType) {
+        return jdbcType == Types.CLOB
+                || jdbcType == Types.NCLOB
+                || jdbcType == Types.LONGVARCHAR
+                || jdbcType == Types.LONGNVARCHAR;
     }
 
     private Object maybeConvertTemporal(Object value) throws SQLException {
@@ -478,6 +579,58 @@ public class OracleLoaderService {
             return toTimestamp(value);
         }
         return value;
+    }
+
+    private byte[] blobToBytes(Blob blob) throws SQLException {
+        if (blob == null) {
+            return null;
+        }
+        try {
+            long length = blob.length();
+            if (length > Integer.MAX_VALUE) {
+                throw new SQLException("BLOB length exceeds supported size: " + length);
+            }
+            return blob.getBytes(1, (int) length);
+        } finally {
+            free(blob);
+        }
+    }
+
+    private String clobToString(Clob clob) throws SQLException {
+        if (clob == null) {
+            return null;
+        }
+        try {
+            long length = clob.length();
+            if (length > Integer.MAX_VALUE) {
+                throw new SQLException("CLOB length exceeds supported size: " + length);
+            }
+            return clob.getSubString(1, (int) length);
+        } finally {
+            free(clob);
+        }
+    }
+
+    private void free(Blob blob) {
+        if (blob == null) {
+            return;
+        }
+        try {
+            blob.free();
+        } catch (AbstractMethodError | SQLException ignored) {
+            // Some drivers (or older JDBC versions) do not support free(); ignore such cases.
+        }
+    }
+
+    private void free(Clob clob) {
+        if (clob == null) {
+            return;
+        }
+        try {
+            clob.free();
+        } catch (AbstractMethodError | SQLException ignored) {
+            // Ignore drivers that do not implement free()
+        }
     }
 
     private Object toTimestamp(Object value) throws SQLException {

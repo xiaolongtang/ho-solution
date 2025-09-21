@@ -5,6 +5,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
+import javax.sql.rowset.serial.SerialBlob;
+import javax.sql.rowset.serial.SerialClob;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -12,6 +14,8 @@ import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
@@ -22,8 +26,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class OracleLoaderServiceTest {
 
@@ -81,6 +90,131 @@ class OracleLoaderServiceTest {
 
         String integerType = (String) method.invoke(loader, Types.NUMERIC, 5, 0);
         assertEquals("INTEGER", integerType);
+    }
+
+    @Test
+    void readColumnValueConvertsLobsToSupportedTypes() throws Exception {
+        OracleLoaderService loader = new OracleLoaderService(
+                new JdbcTemplate(newH2DataSource("target" + randomSuffix())),
+                newH2DataSource("oracle" + randomSuffix()),
+                "TEST",
+                1,
+                100,
+                1,
+                ""
+        );
+
+        Method method = OracleLoaderService.class.getDeclaredMethod(
+                "readColumnValue", ResultSet.class, ResultSetMetaData.class, int.class);
+        method.setAccessible(true);
+
+        byte[] blobData = new byte[]{0x01, 0x02, 0x03};
+
+        ResultSet blobRs = mock(ResultSet.class);
+        ResultSetMetaData blobMeta = mock(ResultSetMetaData.class);
+        when(blobMeta.getColumnType(1)).thenReturn(Types.BLOB);
+        when(blobRs.getBytes(1)).thenReturn(blobData);
+        when(blobRs.wasNull()).thenReturn(false);
+        Object blobValue = method.invoke(loader, blobRs, blobMeta, 1);
+        assertArrayEquals(blobData, (byte[]) blobValue);
+
+        ResultSet nullBlobRs = mock(ResultSet.class);
+        ResultSetMetaData nullBlobMeta = mock(ResultSetMetaData.class);
+        when(nullBlobMeta.getColumnType(1)).thenReturn(Types.BLOB);
+        when(nullBlobRs.getBytes(1)).thenReturn(null);
+        when(nullBlobRs.wasNull()).thenReturn(true);
+        Object nullBlobValue = method.invoke(loader, nullBlobRs, nullBlobMeta, 1);
+        assertNull(nullBlobValue);
+
+        ResultSet blobObjectRs = mock(ResultSet.class);
+        ResultSetMetaData blobObjectMeta = mock(ResultSetMetaData.class);
+        when(blobObjectMeta.getColumnType(1)).thenReturn(Types.OTHER);
+        SerialBlob serialBlob = new SerialBlob(blobData);
+        when(blobObjectRs.getObject(1)).thenReturn(serialBlob);
+        Object blobObjectValue = method.invoke(loader, blobObjectRs, blobObjectMeta, 1);
+        assertArrayEquals(blobData, (byte[]) blobObjectValue);
+
+        ResultSet clobRs = mock(ResultSet.class);
+        ResultSetMetaData clobMeta = mock(ResultSetMetaData.class);
+        when(clobMeta.getColumnType(1)).thenReturn(Types.CLOB);
+        when(clobRs.getString(1)).thenReturn("hello");
+        when(clobRs.wasNull()).thenReturn(false);
+        Object clobValue = method.invoke(loader, clobRs, clobMeta, 1);
+        assertEquals("hello", clobValue);
+
+        ResultSet nullClobRs = mock(ResultSet.class);
+        ResultSetMetaData nullClobMeta = mock(ResultSetMetaData.class);
+        when(nullClobMeta.getColumnType(1)).thenReturn(Types.CLOB);
+        when(nullClobRs.getString(1)).thenReturn(null);
+        when(nullClobRs.wasNull()).thenReturn(true);
+        Object nullClobValue = method.invoke(loader, nullClobRs, nullClobMeta, 1);
+        assertNull(nullClobValue);
+
+        ResultSet clobObjectRs = mock(ResultSet.class);
+        ResultSetMetaData clobObjectMeta = mock(ResultSetMetaData.class);
+        when(clobObjectMeta.getColumnType(1)).thenReturn(Types.OTHER);
+        SerialClob serialClob = new SerialClob("world".toCharArray());
+        when(clobObjectRs.getObject(1)).thenReturn(serialClob);
+        Object clobObjectValue = method.invoke(loader, clobObjectRs, clobObjectMeta, 1);
+        assertEquals("world", clobObjectValue);
+    }
+
+    @Test
+    void blacklistSupportsWildcardPatterns() throws Exception {
+        OracleLoaderService loader = new OracleLoaderService(
+                new JdbcTemplate(newH2DataSource("target" + randomSuffix())),
+                newH2DataSource("oracle" + randomSuffix()),
+                "TEST",
+                1,
+                100,
+                1,
+                "EMP, T_*, TEST.SECRET_*"
+        );
+
+        Method method = OracleLoaderService.class.getDeclaredMethod("isBlacklisted", String.class);
+        method.setAccessible(true);
+
+        assertTrue((boolean) method.invoke(loader, "EMP"));
+        assertTrue((boolean) method.invoke(loader, "t_alpha"));
+        assertTrue((boolean) method.invoke(loader, "SECRET_TABLE"));
+        assertFalse((boolean) method.invoke(loader, "DEPT"));
+        assertFalse((boolean) method.invoke(loader, "PUBLIC_DATA"));
+    }
+
+    @Test
+    void runFullRefreshSkipsTablesMatchingWildcardBlacklist() {
+        String schema = "TEST";
+        JdbcTemplate target = new JdbcTemplate(newH2DataSource("h2target" + randomSuffix()));
+
+        DriverManagerDataSource oracleDelegate = newH2DataSource("oraclesrc" + randomSuffix());
+        JdbcTemplate oracleJdbc = new JdbcTemplate(oracleDelegate);
+        setupOracleSource(oracleJdbc, schema);
+
+        oracleJdbc.execute("DROP TABLE IF EXISTS " + schema + ".T_SKIP");
+        oracleJdbc.execute("CREATE TABLE " + schema + ".T_SKIP (ID INT PRIMARY KEY, NAME VARCHAR(32))");
+        oracleJdbc.update("INSERT INTO " + schema + ".T_SKIP (ID, NAME) VALUES (?, ?)", 1, "IgnoreMe");
+        oracleJdbc.update("INSERT INTO ALL_TABLES (OWNER, TABLE_NAME) VALUES (?, ?)", schema, "T_SKIP");
+
+        OracleLoaderService loader = new OracleLoaderService(
+                target,
+                oracleDelegate,
+                schema,
+                2,
+                2,
+                1,
+                "T_*"
+        );
+
+        loader.runFullRefresh();
+
+        Integer skipTables = target.queryForObject(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'T_SKIP'",
+                Integer.class
+        );
+        assertEquals(0, skipTables);
+
+        assertEquals(3, target.queryForObject("SELECT COUNT(*) FROM \"EMP\"", Integer.class));
+        assertEquals(2, target.queryForObject("SELECT COUNT(*) FROM \"DEPT\"", Integer.class));
     }
 
     private static DriverManagerDataSource newH2DataSource(String dbName) {
