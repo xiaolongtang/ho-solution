@@ -14,6 +14,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
@@ -58,6 +59,28 @@ class OracleLoaderServiceTest {
                 "Expected at least two concurrent Oracle connections during parallel load");
         assertEquals(7, trackingOracle.getTotalConnections(),
                 "Unexpected number of Oracle connections opened during refresh");
+    }
+
+    @Test
+    void mapTypeHandlesNegativeScaleForOracleNumber() throws Exception {
+        OracleLoaderService loader = new OracleLoaderService(
+                new JdbcTemplate(newH2DataSource("target" + randomSuffix())),
+                newH2DataSource("oracle" + randomSuffix()),
+                "TEST",
+                1,
+                100,
+                1,
+                ""
+        );
+
+        Method method = OracleLoaderService.class.getDeclaredMethod("mapType", int.class, int.class, int.class);
+        method.setAccessible(true);
+
+        String decimalType = (String) method.invoke(loader, Types.NUMERIC, 0, -127);
+        assertEquals("DECIMAL(38,12)", decimalType);
+
+        String integerType = (String) method.invoke(loader, Types.NUMERIC, 5, 0);
+        assertEquals("INTEGER", integerType);
     }
 
     private static DriverManagerDataSource newH2DataSource(String dbName) {

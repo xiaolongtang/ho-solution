@@ -311,12 +311,20 @@ public class OracleLoaderService {
                 return "BIGINT";
             case Types.DECIMAL:
             case Types.NUMERIC:
-                if (scale == 0) {
+                if (scale == 0 && precision > 0) {
                     if (precision <= 9) return "INTEGER";
                     if (precision <= 18) return "BIGINT";
                 }
                 int p = Math.min(precision == 0 ? 38 : precision, 38);
-                int s = Math.max(0, Math.min(scale, 12));
+                int s;
+                if (scale < 0) {
+                    s = Math.min(p, 12);
+                } else {
+                    s = Math.min(scale, 12);
+                }
+                if (s <= 0 || s > p) {
+                    s = Math.min(p, 12);
+                }
                 return "DECIMAL(" + p + "," + s + ")";
             case Types.FLOAT:
             case Types.REAL:
