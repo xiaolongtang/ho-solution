@@ -436,6 +436,17 @@ public class OracleLoaderService {
 
     private Object readColumnValue(ResultSet rs, ResultSetMetaData md, int index) throws SQLException {
         int jdbcType = md.getColumnType(index);
+
+        if (isBinaryType(jdbcType)) {
+            byte[] data = rs.getBytes(index);
+            return rs.wasNull() ? null : data;
+        }
+
+        if (isClobType(jdbcType)) {
+            String text = rs.getString(index);
+            return rs.wasNull() ? null : text;
+        }
+
         if (isTemporalType(jdbcType)) {
             try {
                 Timestamp ts = rs.getTimestamp(index);
@@ -448,6 +459,14 @@ public class OracleLoaderService {
         }
 
         Object value = rs.getObject(index);
+
+        if (value instanceof Blob) {
+            return blobToBytes((Blob) value);
+        }
+        if (value instanceof Clob) {
+            return clobToString((Clob) value);
+        }
+
         if (isTemporalType(jdbcType)) {
             return toTimestamp(value);
         }
@@ -460,6 +479,20 @@ public class OracleLoaderService {
                 || jdbcType == Types.TIMESTAMP
                 || jdbcType == Types.TIMESTAMP_WITH_TIMEZONE
                 || jdbcType == Types.TIME_WITH_TIMEZONE;
+    }
+
+    private boolean isBinaryType(int jdbcType) {
+        return jdbcType == Types.BLOB
+                || jdbcType == Types.BINARY
+                || jdbcType == Types.VARBINARY
+                || jdbcType == Types.LONGVARBINARY;
+    }
+
+    private boolean isClobType(int jdbcType) {
+        return jdbcType == Types.CLOB
+                || jdbcType == Types.NCLOB
+                || jdbcType == Types.LONGVARCHAR
+                || jdbcType == Types.LONGNVARCHAR;
     }
 
     private Object maybeConvertTemporal(Object value) throws SQLException {
@@ -478,6 +511,58 @@ public class OracleLoaderService {
             return toTimestamp(value);
         }
         return value;
+    }
+
+    private byte[] blobToBytes(Blob blob) throws SQLException {
+        if (blob == null) {
+            return null;
+        }
+        try {
+            long length = blob.length();
+            if (length > Integer.MAX_VALUE) {
+                throw new SQLException("BLOB length exceeds supported size: " + length);
+            }
+            return blob.getBytes(1, (int) length);
+        } finally {
+            free(blob);
+        }
+    }
+
+    private String clobToString(Clob clob) throws SQLException {
+        if (clob == null) {
+            return null;
+        }
+        try {
+            long length = clob.length();
+            if (length > Integer.MAX_VALUE) {
+                throw new SQLException("CLOB length exceeds supported size: " + length);
+            }
+            return clob.getSubString(1, (int) length);
+        } finally {
+            free(clob);
+        }
+    }
+
+    private void free(Blob blob) {
+        if (blob == null) {
+            return;
+        }
+        try {
+            blob.free();
+        } catch (AbstractMethodError | SQLException ignored) {
+            // Some drivers (or older JDBC versions) do not support free(); ignore such cases.
+        }
+    }
+
+    private void free(Clob clob) {
+        if (clob == null) {
+            return;
+        }
+        try {
+            clob.free();
+        } catch (AbstractMethodError | SQLException ignored) {
+            // Ignore drivers that do not implement free()
+        }
     }
 
     private Object toTimestamp(Object value) throws SQLException {
