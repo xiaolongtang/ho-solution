@@ -9,7 +9,14 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.sql.*;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
@@ -395,7 +402,7 @@ public class OracleLoaderService {
                             long n = 0;
                             while (rs.next()) {
                                 for (int i = 1; i <= cols; i++) {
-                                    Object v = rs.getObject(i);
+                                    Object v = readColumnValue(rs, md, i);
                                     ins.setObject(i, v);
                                 }
                                 ins.addBatch();
@@ -425,5 +432,121 @@ public class OracleLoaderService {
         } catch (SQLException e) {
             throw new RuntimeException("Bulk insert failed for target " + target, e);
         }
+    }
+
+    private Object readColumnValue(ResultSet rs, ResultSetMetaData md, int index) throws SQLException {
+        int jdbcType = md.getColumnType(index);
+        if (isTemporalType(jdbcType)) {
+            try {
+                Timestamp ts = rs.getTimestamp(index);
+                if (ts != null || rs.wasNull()) {
+                    return ts;
+                }
+            } catch (SQLException ex) {
+                log.debug("Oracle timestamp conversion failed for column {} using getTimestamp: {}", index, ex.getMessage());
+            }
+        }
+
+        Object value = rs.getObject(index);
+        if (isTemporalType(jdbcType)) {
+            return toTimestamp(value);
+        }
+        return maybeConvertTemporal(value);
+    }
+
+    private boolean isTemporalType(int jdbcType) {
+        return jdbcType == Types.DATE
+                || jdbcType == Types.TIME
+                || jdbcType == Types.TIMESTAMP
+                || jdbcType == Types.TIMESTAMP_WITH_TIMEZONE
+                || jdbcType == Types.TIME_WITH_TIMEZONE;
+    }
+
+    private Object maybeConvertTemporal(Object value) throws SQLException {
+        if (value == null) return null;
+        if (value instanceof Timestamp) return value;
+        if (value instanceof java.sql.Date || value instanceof java.sql.Time || value instanceof java.util.Date) {
+            return toTimestamp(value);
+        }
+        if (value instanceof LocalDateTime || value instanceof LocalDate
+                || value instanceof Instant || value instanceof OffsetDateTime
+                || value instanceof ZonedDateTime) {
+            return toTimestamp(value);
+        }
+        String className = value.getClass().getName();
+        if (className.startsWith("oracle.sql.")) {
+            return toTimestamp(value);
+        }
+        return value;
+    }
+
+    private Object toTimestamp(Object value) throws SQLException {
+        if (value == null) return null;
+        if (value instanceof Timestamp) return value;
+        if (value instanceof java.sql.Date) {
+            return new Timestamp(((java.sql.Date) value).getTime());
+        }
+        if (value instanceof java.sql.Time) {
+            return new Timestamp(((java.sql.Time) value).getTime());
+        }
+        if (value instanceof java.util.Date) {
+            return new Timestamp(((java.util.Date) value).getTime());
+        }
+        if (value instanceof LocalDateTime) {
+            return Timestamp.valueOf((LocalDateTime) value);
+        }
+        if (value instanceof LocalDate) {
+            return Timestamp.valueOf(((LocalDate) value).atStartOfDay());
+        }
+        if (value instanceof Instant) {
+            return Timestamp.from((Instant) value);
+        }
+        if (value instanceof OffsetDateTime) {
+            return Timestamp.valueOf(((OffsetDateTime) value).toLocalDateTime());
+        }
+        if (value instanceof ZonedDateTime) {
+            return Timestamp.valueOf(((ZonedDateTime) value).toLocalDateTime());
+        }
+
+        String className = value.getClass().getName();
+        if (className.startsWith("oracle.sql.")) {
+            try {
+                Method method = value.getClass().getMethod("timestampValue");
+                Object ts = method.invoke(value);
+                if (ts instanceof Timestamp) {
+                    return ts;
+                }
+            } catch (NoSuchMethodException ignored) {
+                // fall through and try other conversion methods
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                throw new SQLException("Failed to convert Oracle temporal value of type " + className, e);
+            }
+
+            try {
+                Method method = value.getClass().getMethod("dateValue");
+                Object date = method.invoke(value);
+                if (date instanceof java.sql.Date) {
+                    return new Timestamp(((java.sql.Date) date).getTime());
+                }
+            } catch (NoSuchMethodException ignored) {
+                // fall through
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                throw new SQLException("Failed to convert Oracle temporal value of type " + className, e);
+            }
+
+            try {
+                Method method = value.getClass().getMethod("timeValue");
+                Object time = method.invoke(value);
+                if (time instanceof java.sql.Time) {
+                    return new Timestamp(((java.sql.Time) time).getTime());
+                }
+            } catch (NoSuchMethodException ignored) {
+                // fall through
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                throw new SQLException("Failed to convert Oracle temporal value of type " + className, e);
+            }
+        }
+
+        return value;
     }
 }
