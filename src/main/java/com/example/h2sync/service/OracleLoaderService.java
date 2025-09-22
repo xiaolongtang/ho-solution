@@ -25,6 +25,8 @@ import java.util.stream.Collectors;
 public class OracleLoaderService {
     private static final Logger log = LoggerFactory.getLogger(OracleLoaderService.class);
 
+    private static final String MATERIALIZED_VIEW_SCHEMA = "MV";
+
     private final JdbcTemplate h2;
     private final DataSource oracleDs;
     private final int threads;
@@ -72,6 +74,7 @@ public class OracleLoaderService {
                 .collect(Collectors.toSet());
 
         initFailLogTable();
+        ensureMaterializedViewSchema();
     }
 
     private static DataSource createOracleDataSource(String driverClass, String url, String user, String pass) {
@@ -123,7 +126,7 @@ public class OracleLoaderService {
             }
             for (String v : views) {
                 if (isBlacklisted(v)) continue;
-                futures.add(pool.submit(() -> retry(() -> copyViewAsTable(v), "VIEW", v)));
+                futures.add(pool.submit(() -> retry(() -> copyView(v), "VIEW", v)));
             }
             for (Future<?> f : futures) {
                 try {
@@ -277,19 +280,31 @@ public class OracleLoaderService {
         bulkInsertFromSelect("SELECT * FROM " + src, tgt);
     }
 
-    private void copyViewAsTable(String view) {
+    private void copyView(String view) {
         String src = oracleSchema + "." + view;
-        String tgt = "\"VW_" + view + "\"";
-        log.info("Materializing view {} into {}", src, tgt);
+        String dataTable = String.format("\"%s\".\"%s\"", MATERIALIZED_VIEW_SCHEMA, view);
+        String viewName = "\"" + view + "\"";
+        log.info("Materializing Oracle view {} into H2 table {}", src, dataTable);
+        h2.execute("DROP VIEW IF EXISTS " + viewName);
+        h2.execute("DROP TABLE IF EXISTS " + viewName);
+        h2.execute("DROP TABLE IF EXISTS \"VW_" + view + "\"");
         try (Connection oconn = oracleDs.getConnection();
              Statement s = oconn.createStatement();
              ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
             log.debug("Prepared metadata for view {} using Oracle connection {}", src, oconn);
-            createTargetTableFrom(rs.getMetaData(), tgt);
+            createTargetTableFrom(rs.getMetaData(), dataTable);
         } catch (SQLException e) {
             throw new RuntimeException("Prepare target table failed for view " + src, e);
         }
-        bulkInsertFromSelect("SELECT * FROM " + src, tgt);
+        bulkInsertFromSelect("SELECT * FROM " + src, dataTable);
+        String createViewSql = "CREATE VIEW " + viewName + " AS SELECT * FROM " + dataTable;
+        h2.execute(createViewSql);
+        log.info("Created H2 view {} backed by {}", viewName, dataTable);
+    }
+
+    private void ensureMaterializedViewSchema() {
+        String sql = "CREATE SCHEMA IF NOT EXISTS \"" + MATERIALIZED_VIEW_SCHEMA + "\"";
+        h2.execute(sql);
     }
 
     private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
@@ -329,7 +344,7 @@ public class OracleLoaderService {
                 } else {
                     s = Math.min(scale, 12);
                 }
-                if (s <= 0 || s > p) {
+                if (s < 0 || s > p) {
                     s = Math.min(p, 12);
                 }
                 return "DECIMAL(" + p + "," + s + ")";
