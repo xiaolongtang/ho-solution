@@ -22,6 +22,17 @@ loader:
   maxRetries: 3
   blacklist: ["AUDIT_LOG","SOME_BIG_TABLE_TO_SKIP"]
 
+sample:
+  loader:
+    h2-url: jdbc:h2:./data-sample/h2db;MODE=Oracle;DATABASE_TO_UPPER=false;AUTO_SERVER=TRUE
+    h2-username: sa
+    h2-password: ""
+    threads: 2
+    batchSize: 100
+    maxRetries: 3
+    row-limit: 100
+    blacklist: []
+
 h2:
   tcp:
     port: 9092
