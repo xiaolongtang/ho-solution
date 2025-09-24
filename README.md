@@ -8,7 +8,7 @@ This Spring Boot 3.2.3 service does three things:
 
 1. **Runs an H2 database instance** and exposes it via **TCP** so that other Spring Boot services can connect over JDBC.
 2. Provides a minimal **Swagger UI** API to run **SELECT-only** queries against the H2 instance and stream results as lines with comma-separated columns.
-3. Has a **daily scheduled job** that connects to **Oracle** and performs a **full refresh** into H2 (tables, views materialized as tables, and sequences), with retries, multithreading, and failure logging.
+3. Has a **daily scheduled job** that connects to **Oracle** and performs a **full refresh** into H2 (tables, views translated into native H2 views, and sequences), with retries, multithreading, and failure logging.
 
 ### Why full refresh (drop & reload) daily?
 - It’s **simpler and safer** than incremental, with a much lower risk of logical errors.
@@ -65,7 +65,7 @@ Response is `text/plain`, one row per line, columns joined by comma (quoted as n
 ### Daily Loader (Oracle → H2)
 - **Startup refresh**: automatically runs a full refresh once the application is ready, before the cron schedule kicks in.
 - **Tables**: dropped and recreated from Oracle column metadata, then bulk-inserted (batched, streaming).
-- **Views**: **materialized** into tables named `VW_<VIEWNAME>`.
+- **Views**: recreated as H2 views by translating the Oracle view SQL.
 - **Sequences**: recreated in H2 using Oracle `INCREMENT BY` and **current/next** value (`last_number`).
 - **Blacklist**: set in `loader.blacklist` (case-insensitive, supports `SCHEMA.NAME` form).
 - **Multithreaded**: parallel copy per table/view (`loader.threads`).
@@ -75,6 +75,11 @@ Response is `text/plain`, one row per line, columns joined by comma (quoted as n
 ### Manual Full Refresh
 - `POST /api/loader/full-refresh?reason=<optional>` runs the full loader on demand without restarting Spring Boot.
 - The request blocks until the refresh finishes and returns `200 OK` on success, `409 CONFLICT` if another refresh is running, `503` when the loader is disabled.
+
+### Sample Loader (100-row snapshot)
+- `GET /api/sample-loader/refresh` builds a separate H2 database using `sample.loader.h2-url`.
+- Each Oracle table contributes up to **100 rows** (or fewer if the table is smaller), while views and sequences are recreated one-to-one.
+- Useful when you only need lightweight fixtures without cloning the full dataset. Triggered manually; no scheduler runs it automatically.
 
 Schedule defaults to **02:30 Asia/Tokyo** daily. Adjust with `loader.cron` (Spring cron).
 
@@ -91,7 +96,7 @@ RUNSCRIPT FROM 'backups/h2-backup.zip';
 ### Notes / Limitations
 - Data type mapping is simplified but covers common Oracle types. Tune `mapType()` if needed.
 - Primary keys, indexes, constraints are not copied in this minimal baseline.
-- Views are materialized as tables to avoid dialect incompatibilities.
+- Views are created directly in H2 using translated Oracle SQL.
 - `user_sequences.last_number` is the **next** value in Oracle; we align H2 to that to avoid duplicates.
 
 ---
@@ -102,7 +107,7 @@ RUNSCRIPT FROM 'backups/h2-backup.zip';
 
 1. **启动一个 H2 数据库实例**，通过 **TCP** 对外提供 JDBC 连接（供其它 Spring Boot 服务连接）。
 2. 提供一个极简 **Swagger UI** API（只允许 **SELECT**），把查询结果按“每行一条、列用逗号分隔”的文本流返回。
-3. 带有一个**每日定时任务**，连接 **Oracle**，把数据 **全量刷新** 到 H2（包含表、**视图按表物化**、序列），并且有重试、多线程和失败记录。
+3. 带有一个**每日定时任务**，连接 **Oracle**，把数据 **全量刷新** 到 H2（包含表、**视图转换为 H2 原生视图**、序列），并且有重试、多线程和失败记录。
 
 ### 为何选择每日 **全量**（drop + reload）？
 - **更简单、更稳妥**，出错概率低。
@@ -145,7 +150,7 @@ Swagger：`http://localhost:8080/swagger-ui/index.html`
 ### 每日装载（Oracle → H2）
 - **启动即刷新**：Spring Boot 完全就绪后会立即执行一次全量刷新，然后再按 cron 定时。
 - **表**：根据 Oracle 列元数据在 H2 里**重建表结构**，然后批量写入（流式 + 批处理）。
-- **视图**：在 H2 中**物化为表**，命名为 `VW_<VIEWNAME>`。
+- **视图**：把 Oracle 的视图 SQL 翻译后直接在 H2 中创建同名视图。
 - **序列**：用 Oracle 的 `INCREMENT BY` 和 **当前/下一个值**（`last_number`）在 H2 里重建。
 - **黑名单**：`loader.blacklist` 指定（大小写不敏感，支持 `SCHEMA.NAME`）。
 - **多线程**：按表/视图并行（`loader.threads`）。
@@ -155,6 +160,11 @@ Swagger：`http://localhost:8080/swagger-ui/index.html`
 ### 手动触发全量
 - `POST /api/loader/full-refresh?reason=<可选说明>` 可以在不重启 Spring Boot 的情况下随时触发全量。
 - 接口会在全量完成后返回：成功 `200 OK`，若已有任务在跑返回 `409 CONFLICT`，若 loader 被禁用则返回 `503`。
+
+### 100 条样例装载
+- `GET /api/sample-loader/refresh` 会按 `sample.loader.h2-url` 构建一个**独立**的 H2 数据库。
+- 每张 Oracle 表最多取 **100 行**（如果不足 100 行则全部取），视图与序列也会对应创建。
+- 适用于只需要轻量数据样本的场景，完全手动触发，不会随应用启动或定时任务自动执行。
 
 默认每天 **东京时间 02:30** 执行，修改 `loader.cron` 可调整。
 
@@ -171,7 +181,7 @@ RUNSCRIPT FROM 'backups/h2-backup.zip';
 ### 注意事项
 - 类型映射做了适度简化，覆盖常见 Oracle 类型，必要时可在 `mapType()` 微调。
 - 本版本不复制主键、索引、约束（如需请后续扩展）。
-- 视图在 H2 中以**表**的形式物化，避免方言差异导致的失败。
+- 视图直接在 H2 中根据翻译后的 Oracle SQL 创建。
 - Oracle 的 `user_sequences.last_number` 表示**下一个**值；H2 也对齐到这个值，避免重复。
 
 ---
