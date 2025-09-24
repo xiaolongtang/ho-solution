@@ -9,6 +9,8 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
+import java.io.IOException;
+import java.io.Reader;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.sql.*;
@@ -19,13 +21,13 @@ import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Service
 public class OracleLoaderService {
     private static final Logger log = LoggerFactory.getLogger(OracleLoaderService.class);
-
-    private static final String MATERIALIZED_VIEW_SCHEMA = "MV";
 
     private final JdbcTemplate h2;
     private final DataSource oracleDs;
@@ -74,7 +76,6 @@ public class OracleLoaderService {
                 .collect(Collectors.toSet());
 
         initFailLogTable();
-        ensureMaterializedViewSchema();
     }
 
     private static DataSource createOracleDataSource(String driverClass, String url, String user, String pass) {
@@ -282,29 +283,180 @@ public class OracleLoaderService {
 
     private void copyView(String view) {
         String src = oracleSchema + "." + view;
-        String dataTable = String.format("\"%s\".\"%s\"", MATERIALIZED_VIEW_SCHEMA, view);
         String viewName = "\"" + view + "\"";
-        log.info("Materializing Oracle view {} into H2 table {}", src, dataTable);
-        h2.execute("DROP VIEW IF EXISTS " + viewName);
-        h2.execute("DROP TABLE IF EXISTS " + viewName);
-        h2.execute("DROP TABLE IF EXISTS \"VW_" + view + "\"");
-        try (Connection oconn = oracleDs.getConnection();
-             Statement s = oconn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
-            log.debug("Prepared metadata for view {} using Oracle connection {}", src, oconn);
-            createTargetTableFrom(rs.getMetaData(), dataTable);
-        } catch (SQLException e) {
-            throw new RuntimeException("Prepare target table failed for view " + src, e);
-        }
-        bulkInsertFromSelect("SELECT * FROM " + src, dataTable);
-        String createViewSql = "CREATE VIEW " + viewName + " AS SELECT * FROM " + dataTable;
+        log.info("Creating H2 view {} from Oracle view {}", viewName, src);
+
+        String oracleSql = fetchOracleViewDefinition(view);
+        String translatedSql = translateViewSql(oracleSql);
+
+        dropLegacyArtifacts(viewName, view);
+
+        String createViewSql = "CREATE VIEW " + viewName + " AS " + translatedSql;
         h2.execute(createViewSql);
-        log.info("Created H2 view {} backed by {}", viewName, dataTable);
+        log.info("Created H2 view {} using translated Oracle SQL", viewName);
     }
 
-    private void ensureMaterializedViewSchema() {
-        String sql = "CREATE SCHEMA IF NOT EXISTS \"" + MATERIALIZED_VIEW_SCHEMA + "\"";
-        h2.execute(sql);
+    private void dropLegacyArtifacts(String viewName, String view) {
+        h2.execute("DROP VIEW IF EXISTS " + viewName);
+        try {
+            h2.execute("DROP TABLE IF EXISTS " + viewName);
+        } catch (RuntimeException ex) {
+            log.debug("Ignoring failure while dropping legacy table {}: {}", viewName, ex.getMessage());
+        }
+        String legacyMaterialized = "\"VW_" + view + "\"";
+        try {
+            h2.execute("DROP TABLE IF EXISTS " + legacyMaterialized);
+        } catch (RuntimeException ex) {
+            log.debug("Ignoring failure while dropping legacy materialized table {}: {}", legacyMaterialized, ex.getMessage());
+        }
+        String legacy = "\"MV\".\"" + view + "\"";
+        try {
+            h2.execute("DROP TABLE IF EXISTS " + legacy);
+        } catch (RuntimeException ex) {
+            log.debug("Ignoring failure while dropping legacy MV table {}: {}", legacy, ex.getMessage());
+        }
+    }
+
+    private String fetchOracleViewDefinition(String view) {
+        try (Connection conn = oracleDs.getConnection()) {
+            String definition = fetchViewTextFromAllViews(conn, view);
+            if (definition != null && !definition.isBlank()) {
+                return definition;
+            }
+            return fetchViewTextFromMetadata(conn, view);
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to fetch Oracle view definition for " + view, e);
+        }
+    }
+
+    private String fetchViewTextFromAllViews(Connection conn, String view) throws SQLException {
+        String sql = "SELECT TEXT FROM all_views WHERE owner = ? AND view_name = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            ps.setString(2, view);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                return readLargeText(rs, 1);
+            }
+        }
+    }
+
+    private String fetchViewTextFromMetadata(Connection conn, String view) throws SQLException {
+        log.debug("Falling back to DBMS_METADATA for Oracle view {}", view);
+        try (Statement st = conn.createStatement()) {
+            st.execute("BEGIN DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform,'SQLTERMINATOR',FALSE); END;");
+        } catch (SQLException ex) {
+            log.debug("Failed to configure DBMS_METADATA session transform: {}", ex.getMessage());
+        }
+        String sql = "SELECT dbms_metadata.get_ddl('VIEW', ?, ?) FROM dual";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, view);
+            ps.setString(2, oracleSchema);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    String ddl = readLargeText(rs, 1);
+                    if (ddl != null) {
+                        String select = extractSelectFromDdl(ddl);
+                        if (select != null && !select.isBlank()) {
+                            return select;
+                        }
+                    }
+                }
+            }
+        }
+        throw new SQLException("Unable to retrieve definition for view " + view);
+    }
+
+    private String extractSelectFromDdl(String ddl) {
+        if (ddl == null) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?i)\\bAS\\b").matcher(ddl);
+        if (matcher.find()) {
+            return ddl.substring(matcher.end()).trim();
+        }
+        return null;
+    }
+
+    private String readLargeText(ResultSet rs, int index) throws SQLException {
+        String text = rs.getString(index);
+        if (text != null) {
+            return text;
+        }
+        try (Reader reader = rs.getCharacterStream(index)) {
+            if (reader == null) {
+                return null;
+            }
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[4096];
+            int len;
+            while ((len = reader.read(buf)) != -1) {
+                sb.append(buf, 0, len);
+            }
+            return sb.toString();
+        } catch (IOException ex) {
+            throw new SQLException("Failed to read Oracle text column", ex);
+        }
+    }
+
+    private String translateViewSql(String oracleSql) {
+        if (oracleSql == null) {
+            throw new IllegalArgumentException("Oracle view SQL is null");
+        }
+        String stripped = stripSqlTerminator(stripComments(oracleSql)).trim();
+        if (stripped.isEmpty()) {
+            throw new IllegalArgumentException("Oracle view SQL is empty after cleaning");
+        }
+        String withoutSchema = removeOracleSchemaQualifiers(stripped);
+        String cleaned = removeTrailingReadOnly(withoutSchema).trim();
+        return cleaned;
+    }
+
+    private String stripSqlTerminator(String sql) {
+        String out = sql.trim();
+        while (out.endsWith(";") || out.endsWith("/")) {
+            out = out.substring(0, out.length() - 1).trim();
+        }
+        return out;
+    }
+
+    private String stripComments(String sql) {
+        String noBlock = sql.replaceAll("(?is)/\\*.*?\\*/", " ");
+        StringBuilder sb = new StringBuilder();
+        try (Scanner scanner = new Scanner(noBlock)) {
+            while (scanner.hasNextLine()) {
+                String line = scanner.nextLine();
+                int idx = line.indexOf("--");
+                if (idx >= 0) {
+                    line = line.substring(0, idx);
+                }
+                if (!line.isBlank()) {
+                    if (sb.length() > 0) {
+                        sb.append('\n');
+                    }
+                    sb.append(line);
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    private String removeOracleSchemaQualifiers(String sql) {
+        if (oracleSchema == null || oracleSchema.isBlank()) {
+            return sql;
+        }
+        String result = sql;
+        String quotedSchema = Pattern.quote("\"" + oracleSchema + "\"");
+        result = result.replaceAll("(?i)" + quotedSchema + "\\.", "");
+        result = result.replaceAll("(?i)" + Pattern.quote(oracleSchema) + "\\.", "");
+        return result;
+    }
+
+    private String removeTrailingReadOnly(String sql) {
+        return sql.replaceAll("(?i)WITH\\s+READ\\s+ONLY", " ")
+                .replaceAll("(?i)WITH\\s+CHECK\\s+OPTION", " ");
     }
 
     private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
