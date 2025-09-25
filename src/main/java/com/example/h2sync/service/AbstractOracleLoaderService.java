@@ -108,21 +108,13 @@ public abstract class AbstractOracleLoaderService {
                 if (isBlacklisted(t)) continue;
                 futures.add(pool.submit(() -> retry(() -> copyTable(t), "TABLE", t)));
             }
+            waitForFutures(futures);
+
             for (String v : views) {
                 if (isBlacklisted(v)) continue;
                 futures.add(pool.submit(() -> retry(() -> copyView(v), "VIEW", v)));
             }
-            for (Future<?> f : futures) {
-                try {
-                    f.get();
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException("Interrupted while waiting for Oracle tasks", ie);
-                } catch (ExecutionException ee) {
-                    // retry() already recorded the failure and rethrew, so nothing more to do here.
-                }
-            }
-            futures.clear();
+            waitForFutures(futures);
 
             for (Map<String, Object> seq : sequences) {
                 String name = (String) seq.get("SEQUENCE_NAME");
@@ -141,6 +133,23 @@ public abstract class AbstractOracleLoaderService {
         if (blacklist.contains(n)) return true;
         if (oracleSchema != null && blacklist.contains(oracleSchema + "." + n)) return true;
         return false;
+    }
+
+    private void waitForFutures(List<Future<?>> futures) {
+        try {
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting for Oracle tasks", ie);
+                } catch (ExecutionException ee) {
+                    // retry() already recorded the failure and rethrew, so nothing more to do here.
+                }
+            }
+        } finally {
+            futures.clear();
+        }
     }
 
     private void retry(Runnable task, String type, String name) {
@@ -287,19 +296,19 @@ public abstract class AbstractOracleLoaderService {
     private void dropLegacyArtifacts(String viewName, String view) {
         h2.execute("DROP VIEW IF EXISTS " + viewName);
         try {
-            h2.execute("DROP TABLE IF EXISTS " + viewName);
+            h2.execute("DROP TABLE IF EXISTS " + viewName + " CASCADE");
         } catch (RuntimeException ex) {
             log.debug("Ignoring failure while dropping legacy table {}: {}", viewName, ex.getMessage());
         }
         String legacyMaterialized = "\"VW_" + view + "\"";
         try {
-            h2.execute("DROP TABLE IF EXISTS " + legacyMaterialized);
+            h2.execute("DROP TABLE IF EXISTS " + legacyMaterialized + " CASCADE");
         } catch (RuntimeException ex) {
             log.debug("Ignoring failure while dropping legacy materialized table {}: {}", legacyMaterialized, ex.getMessage());
         }
         String legacy = "\"MV\".\"" + view + "\"";
         try {
-            h2.execute("DROP TABLE IF EXISTS " + legacy);
+            h2.execute("DROP TABLE IF EXISTS " + legacy + " CASCADE");
         } catch (RuntimeException ex) {
             log.debug("Ignoring failure while dropping legacy MV table {}: {}", legacy, ex.getMessage());
         }
@@ -678,6 +687,7 @@ public abstract class AbstractOracleLoaderService {
 
     private String moveJoinFiltersToWhere(String sql) {
         StringBuilder builder = new StringBuilder(sql);
+        Map<Integer, PendingWhereClause> pending = new HashMap<>();
         int offset = 0;
         while (offset < builder.length()) {
             int joinIndex = findKeywordOutsideQuotes(builder, offset, "JOIN");
@@ -720,20 +730,42 @@ public abstract class AbstractOracleLoaderService {
             }
             builder.replace(clauseStart, clauseEnd, primary);
             int afterPrimary = clauseStart + primary.length();
-            String extrasClause = String.join(" AND ", extras);
-            int whereIndex = findKeywordAtDepth(builder, afterPrimary, depth, "WHERE");
+
+            PendingWhereClause pendingClause = pending.computeIfAbsent(depth, d -> new PendingWhereClause());
+            pendingClause.addExtras(extras);
+            pendingClause.updateSearchStart(afterPrimary);
+
+            offset = afterPrimary;
+        }
+
+        if (pending.isEmpty()) {
+            return builder.toString();
+        }
+
+        List<Map.Entry<Integer, PendingWhereClause>> entries = new ArrayList<>(pending.entrySet());
+        int builderLength = builder.length();
+        entries.sort(Comparator.comparingInt(e -> -e.getValue().searchStartOr(builderLength)));
+
+        for (Map.Entry<Integer, PendingWhereClause> entry : entries) {
+            int depth = entry.getKey();
+            PendingWhereClause clause = entry.getValue();
+            String extrasClause = String.join(" AND ", clause.getExtras());
+            if (extrasClause.isEmpty()) {
+                continue;
+            }
+            int start = clause.searchStartOr(builder.length());
+            int whereIndex = findKeywordAtDepth(builder, start, depth, "WHERE");
             if (whereIndex != -1) {
                 int whereEnd = findEndOfWhereClause(builder, whereIndex + 5, depth);
                 String addition = " AND " + extrasClause;
                 builder.insert(whereEnd, addition);
-                offset = whereEnd + addition.length();
             } else {
-                int boundary = findNextClauseBoundary(builder, afterPrimary, depth);
+                int boundary = findNextClauseBoundary(builder, start, depth);
                 String addition = " WHERE " + extrasClause;
                 builder.insert(boundary, addition);
-                offset = boundary + addition.length();
             }
         }
+
         return builder.toString();
     }
 
@@ -787,6 +819,29 @@ public abstract class AbstractOracleLoaderService {
         }
         parts.add(input.substring(start));
         return parts;
+    }
+
+    private static final class PendingWhereClause {
+        private final List<String> extras = new ArrayList<>();
+        private int searchStart = Integer.MAX_VALUE;
+
+        void addExtras(Collection<String> items) {
+            extras.addAll(items);
+        }
+
+        void updateSearchStart(int candidate) {
+            if (candidate < searchStart) {
+                searchStart = candidate;
+            }
+        }
+
+        List<String> getExtras() {
+            return extras;
+        }
+
+        int searchStartOr(int defaultValue) {
+            return searchStart == Integer.MAX_VALUE ? defaultValue : searchStart;
+        }
     }
 
     private boolean isPartOfBetween(CharSequence sql, int sectionStart, int andOffset) {
@@ -1125,7 +1180,7 @@ public abstract class AbstractOracleLoaderService {
     }
 
     private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
-        String drop = "DROP TABLE IF EXISTS " + target;
+        String drop = "DROP TABLE IF EXISTS " + target + " CASCADE";
         h2.execute(drop);
         StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(target).append(" (");
         for (int i = 1; i <= md.getColumnCount(); i++) {
