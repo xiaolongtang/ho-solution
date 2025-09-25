@@ -185,6 +185,32 @@ class OracleLoaderServiceTest {
         assertEquals(expected, translated);
     }
 
+    @Test
+    void translateViewSqlQuotesH2ReservedKeywords() throws Exception {
+        OracleLoaderService loader = new OracleLoaderService(
+                new JdbcTemplate(newH2DataSource("target" + randomSuffix())),
+                newH2DataSource("oracle" + randomSuffix()),
+                "TEST",
+                1,
+                100,
+                1,
+                ""
+        );
+
+        Method method = OracleLoaderService.class.getDeclaredMethod("translateViewSql", String.class);
+        method.setAccessible(true);
+
+        String oracleSql = "select value, type, other.value value_alias from test.sample other " +
+                "where type = 'A' and other.type > 0";
+
+        String translated = (String) method.invoke(loader, oracleSql);
+
+        String expected = "SELECT \"VALUE\", \"TYPE\", OTHER.\"VALUE\" VALUE_ALIAS FROM SAMPLE OTHER " +
+                "WHERE \"TYPE\" = 'A' AND OTHER.\"TYPE\" > 0";
+
+        assertEquals(expected, translated);
+    }
+
     private static DriverManagerDataSource newH2DataSource(String dbName) {
         DriverManagerDataSource ds = new DriverManagerDataSource();
         ds.setDriverClassName("org.h2.Driver");
