@@ -76,6 +76,11 @@ Response is `text/plain`, one row per line, columns joined by comma (quoted as n
 - `POST /api/loader/full-refresh?reason=<optional>` runs the full loader on demand without restarting Spring Boot.
 - The request blocks until the refresh finishes and returns `200 OK` on success, `409 CONFLICT` if another refresh is running, `503` when the loader is disabled.
 
+### Sample Loader (100-row snapshot)
+- `GET /api/sample-loader/refresh` builds a separate H2 database using `sample.loader.h2-url`.
+- Each Oracle table contributes up to **100 rows** (or fewer if the table is smaller), while views and sequences are recreated one-to-one.
+- Useful when you only need lightweight fixtures without cloning the full dataset. Triggered manually; no scheduler runs it automatically.
+
 Schedule defaults to **02:30 Asia/Tokyo** daily. Adjust with `loader.cron` (Spring cron).
 
 ### Backup
@@ -155,6 +160,11 @@ Swagger：`http://localhost:8080/swagger-ui/index.html`
 ### 手动触发全量
 - `POST /api/loader/full-refresh?reason=<可选说明>` 可以在不重启 Spring Boot 的情况下随时触发全量。
 - 接口会在全量完成后返回：成功 `200 OK`，若已有任务在跑返回 `409 CONFLICT`，若 loader 被禁用则返回 `503`。
+
+### 100 条样例装载
+- `GET /api/sample-loader/refresh` 会按 `sample.loader.h2-url` 构建一个**独立**的 H2 数据库。
+- 每张 Oracle 表最多取 **100 行**（如果不足 100 行则全部取），视图与序列也会对应创建。
+- 适用于只需要轻量数据样本的场景，完全手动触发，不会随应用启动或定时任务自动执行。
 
 默认每天 **东京时间 02:30** 执行，修改 `loader.cron` 可调整。
 
