@@ -110,11 +110,7 @@ public abstract class AbstractOracleLoaderService {
             }
             waitForFutures(futures);
 
-            for (String v : views) {
-                if (isBlacklisted(v)) continue;
-                futures.add(pool.submit(() -> retry(() -> copyView(v), "VIEW", v)));
-            }
-            waitForFutures(futures);
+            syncViewsWithDependencyAwareness(views);
 
             for (Map<String, Object> seq : sequences) {
                 String name = (String) seq.get("SEQUENCE_NAME");
@@ -149,6 +145,83 @@ public abstract class AbstractOracleLoaderService {
             }
         } finally {
             futures.clear();
+        }
+    }
+
+    private void syncViewsWithDependencyAwareness(Set<String> views) {
+        Deque<String> queue = new ArrayDeque<>();
+        for (String view : views) {
+            if (!isBlacklisted(view)) {
+                queue.addLast(view);
+            }
+        }
+
+        Map<String, Integer> attempts = new HashMap<>();
+        Map<String, Integer> deferrals = new HashMap<>();
+        int deferralLimit = Math.max(3, maxRetries) * 4;
+
+        while (!queue.isEmpty()) {
+            String view = queue.removeFirst();
+            int attempt = attempts.merge(view, 1, Integer::sum);
+            try {
+                copyView(view);
+                recordSuccess("VIEW", view);
+            } catch (RuntimeException ex) {
+                if (shouldDeferViewCreation(ex) && deferrals.merge(view, 1, Integer::sum) <= deferralLimit) {
+                    int deferralCount = deferrals.get(view);
+                    log.info("Deferring creation of view {} until dependencies are available (attempt {}, deferral {}). Cause: {}",
+                            view, attempt, deferralCount, extractMessage(ex));
+                    sleepQuietly(500L * Math.min(deferralCount, 6));
+                    queue.addLast(view);
+                } else {
+                    recordFailure("VIEW", view, attempt, ex);
+                    log.warn("Giving up on view {} after {} attempts due to error: {}", view, attempt, ex.toString());
+                }
+            } catch (Exception ex) {
+                recordFailure("VIEW", view, attempt, ex);
+                log.warn("Giving up on view {} after {} attempts due to error: {}", view, attempt, ex.toString());
+            }
+        }
+    }
+
+    private boolean shouldDeferViewCreation(Throwable ex) {
+        Throwable current = ex;
+        while (current != null) {
+            if (current instanceof SQLException) {
+                SQLException sqlEx = (SQLException) current;
+                if ("42S02".equalsIgnoreCase(sqlEx.getSQLState())) {
+                    return true;
+                }
+                String message = sqlEx.getMessage();
+                if (message != null) {
+                    String upper = message.toUpperCase(Locale.ROOT);
+                    if (upper.contains("TABLE \"") && upper.contains("NOT FOUND")) {
+                        return true;
+                    }
+                    if (upper.contains("VIEW \"") && upper.contains("NOT FOUND")) {
+                        return true;
+                    }
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private String extractMessage(Throwable ex) {
+        String message = ex.getMessage();
+        if (message != null && !message.isBlank()) {
+            return truncate(message, 512);
+        }
+        Throwable cause = ex.getCause();
+        return cause == null ? ex.toString() : extractMessage(cause);
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
 
