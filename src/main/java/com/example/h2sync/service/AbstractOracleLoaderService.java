@@ -288,9 +288,97 @@ public abstract class AbstractOracleLoaderService {
 
         dropLegacyArtifacts(viewName, view);
 
-        String createViewSql = "CREATE VIEW " + viewName + " AS " + translatedSql;
+        List<String> columns = ensureUniqueColumnNames(view, fetchOracleViewColumns(view));
+        String columnList = columns.isEmpty()
+                ? ""
+                : columns.stream()
+                .map(this::quoteIdentifier)
+                .collect(Collectors.joining(", ", " (", ")"));
+
+        String createViewSql = "CREATE VIEW " + viewName + columnList + " AS " + translatedSql;
         h2.execute(createViewSql);
         log.info("Created H2 view {} using translated Oracle SQL", viewName);
+    }
+
+    private List<String> fetchOracleViewColumns(String view) {
+        if (oracleSchema == null || oracleSchema.isBlank()) {
+            return Collections.emptyList();
+        }
+
+        String sql = "SELECT column_name FROM all_tab_columns WHERE owner = ? AND table_name = ? ORDER BY column_id";
+        try (Connection conn = oracleDs.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            ps.setString(2, view);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<String> columns = new ArrayList<>();
+                while (rs.next()) {
+                    String column = rs.getString(1);
+                    if (column != null && !column.isBlank()) {
+                        columns.add(column);
+                    }
+                }
+                if (columns.isEmpty()) {
+                    log.warn("No columns found for Oracle view {}. Falling back to default column names", view);
+                }
+                return columns;
+            }
+        } catch (SQLException e) {
+            log.warn("Failed to fetch column metadata for Oracle view {}. Proceeding without explicit column list", view, e);
+            return Collections.emptyList();
+        }
+    }
+
+    private List<String> ensureUniqueColumnNames(String view, List<String> columns) {
+        if (columns.isEmpty()) {
+            return columns;
+        }
+
+        List<String> unique = new ArrayList<>(columns.size());
+        Map<String, Integer> suffixes = new HashMap<>();
+        Set<String> used = new HashSet<>();
+        boolean renamed = false;
+
+        for (String original : columns) {
+            if (original == null) {
+                continue;
+            }
+            String base = original.trim();
+            if (base.isEmpty()) {
+                continue;
+            }
+
+            String candidate = base;
+            String normalizedCandidate = candidate.toUpperCase(Locale.ROOT);
+            int suffix = suffixes.getOrDefault(base.toUpperCase(Locale.ROOT), 0);
+
+            while (!used.add(normalizedCandidate)) {
+                renamed = true;
+                suffix++;
+                candidate = base + "_" + suffix;
+                normalizedCandidate = candidate.toUpperCase(Locale.ROOT);
+            }
+
+            suffixes.put(base.toUpperCase(Locale.ROOT), suffix);
+            unique.add(candidate);
+        }
+
+        if (renamed) {
+            log.warn("Oracle view {} contains duplicate column names. Renamed columns for H2 as {}", view, unique);
+        }
+
+        return unique;
+    }
+
+    private String quoteIdentifier(String identifier) {
+        if (identifier == null) {
+            throw new IllegalArgumentException("Identifier is null");
+        }
+        String trimmed = identifier.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("Identifier is blank");
+        }
+        return "\"" + trimmed.replace("\"", "\"\"") + "\"";
     }
 
     private void dropLegacyArtifacts(String viewName, String view) {
