@@ -409,7 +409,8 @@ public abstract class AbstractOracleLoaderService {
         String withoutSchema = removeOracleSchemaQualifiers(stripped);
         String cleaned = removeTrailingReadOnly(withoutSchema).trim();
         String uppercased = uppercaseUnquotedIdentifiers(cleaned);
-        return replaceOracleSpecificFunctions(uppercased);
+        String protectedKeywords = quoteH2ReservedKeywords(uppercased);
+        return replaceOracleSpecificFunctions(protectedKeywords);
     }
 
     private String stripSqlTerminator(String sql) {
@@ -509,6 +510,74 @@ public abstract class AbstractOracleLoaderService {
                     }
                 }
                 result.append(sql.substring(start, i).toUpperCase(Locale.ROOT));
+            } else {
+                result.append(c);
+                i++;
+            }
+        }
+        return result.toString();
+    }
+
+    private static final Set<String> H2_RESERVED_IDENTIFIERS =
+            Set.of("VALUE", "TYPE");
+
+    private String quoteH2ReservedKeywords(String sql) {
+        StringBuilder result = new StringBuilder(sql.length() + 16);
+        int len = sql.length();
+        int i = 0;
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                result.append(c);
+                i++;
+                while (i < len) {
+                    char current = sql.charAt(i);
+                    result.append(current);
+                    if (current == '\'') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '\'') {
+                            result.append(sql.charAt(i + 1));
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+            } else if (c == '"') {
+                result.append(c);
+                i++;
+                while (i < len) {
+                    char current = sql.charAt(i);
+                    result.append(current);
+                    if (current == '"') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '"') {
+                            result.append(sql.charAt(i + 1));
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+            } else if (Character.isLetter(c) || c == '_' || c == '$' || c == '#') {
+                int start = i;
+                i++;
+                while (i < len) {
+                    char current = sql.charAt(i);
+                    if (Character.isLetterOrDigit(current) || current == '_' || current == '$' || current == '#') {
+                        i++;
+                    } else {
+                        break;
+                    }
+                }
+                String token = sql.substring(start, i);
+                if (H2_RESERVED_IDENTIFIERS.contains(token)) {
+                    result.append('"').append(token).append('"');
+                } else {
+                    result.append(token);
+                }
             } else {
                 result.append(c);
                 i++;
