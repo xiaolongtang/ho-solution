@@ -399,7 +399,8 @@ public abstract class AbstractOracleLoaderService {
         }
         String withoutSchema = removeOracleSchemaQualifiers(stripped);
         String cleaned = removeTrailingReadOnly(withoutSchema).trim();
-        return cleaned;
+        String uppercased = uppercaseUnquotedIdentifiers(cleaned);
+        return replaceOracleSpecificFunctions(uppercased);
     }
 
     private String stripSqlTerminator(String sql) {
@@ -445,6 +446,233 @@ public abstract class AbstractOracleLoaderService {
     private String removeTrailingReadOnly(String sql) {
         return sql.replaceAll("(?i)WITH\\s+READ\\s+ONLY", " ")
                 .replaceAll("(?i)WITH\\s+CHECK\\s+OPTION", " ");
+    }
+
+    private String uppercaseUnquotedIdentifiers(String sql) {
+        StringBuilder result = new StringBuilder(sql.length());
+        int len = sql.length();
+        int i = 0;
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                result.append(c);
+                i++;
+                while (i < len) {
+                    char current = sql.charAt(i);
+                    result.append(current);
+                    if (current == '\'') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '\'') {
+                            result.append(sql.charAt(i + 1));
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+            } else if (c == '"') {
+                result.append(c);
+                i++;
+                while (i < len) {
+                    char current = sql.charAt(i);
+                    result.append(current);
+                    if (current == '"') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '"') {
+                            result.append(sql.charAt(i + 1));
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+            } else if (Character.isLetter(c) || c == '_' || c == '$' || c == '#') {
+                int start = i;
+                i++;
+                while (i < len) {
+                    char current = sql.charAt(i);
+                    if (Character.isLetterOrDigit(current) || current == '_' || current == '$' || current == '#') {
+                        i++;
+                    } else {
+                        break;
+                    }
+                }
+                result.append(sql.substring(start, i).toUpperCase(Locale.ROOT));
+            } else {
+                result.append(c);
+                i++;
+            }
+        }
+        return result.toString();
+    }
+
+    private String replaceOracleSpecificFunctions(String sql) {
+        return replaceNvl2(sql);
+    }
+
+    private String replaceNvl2(String sql) {
+        StringBuilder result = new StringBuilder(sql.length());
+        int len = sql.length();
+        int i = 0;
+        while (i < len) {
+            if (matchesFunction(sql, i, "NVL2")) {
+                int funcStart = i;
+                i += 4;
+                int afterName = skipWhitespace(sql, i);
+                if (afterName >= len || sql.charAt(afterName) != '(') {
+                    result.append(sql, funcStart, i);
+                    continue;
+                }
+                int openParenIndex = afterName;
+                int closeParenIndex = findMatchingParenthesis(sql, openParenIndex);
+                if (closeParenIndex == -1) {
+                    result.append(sql, funcStart, i);
+                    continue;
+                }
+                String inner = sql.substring(openParenIndex + 1, closeParenIndex);
+                List<String> args = splitTopLevelArguments(inner);
+                if (args.size() != 3) {
+                    result.append(sql, funcStart, closeParenIndex + 1);
+                    i = closeParenIndex + 1;
+                    continue;
+                }
+                String expr = replaceNvl2(args.get(0).trim());
+                String notNullValue = replaceNvl2(args.get(1).trim());
+                String nullValue = replaceNvl2(args.get(2).trim());
+                result.append("CASE WHEN ")
+                        .append(expr)
+                        .append(" IS NOT NULL THEN ")
+                        .append(notNullValue)
+                        .append(" ELSE ")
+                        .append(nullValue)
+                        .append(" END");
+                i = closeParenIndex + 1;
+            } else {
+                result.append(sql.charAt(i));
+                i++;
+            }
+        }
+        return result.toString();
+    }
+
+    private boolean matchesFunction(String sql, int offset, String name) {
+        int len = sql.length();
+        int nameLen = name.length();
+        if (offset + nameLen > len) {
+            return false;
+        }
+        for (int i = 0; i < nameLen; i++) {
+            char c = sql.charAt(offset + i);
+            if (Character.toUpperCase(c) != name.charAt(i)) {
+                return false;
+            }
+        }
+        if (offset > 0) {
+            char prev = sql.charAt(offset - 1);
+            if (Character.isLetterOrDigit(prev) || prev == '_' || prev == '$' || prev == '#') {
+                return false;
+            }
+        }
+        if (offset + nameLen < len) {
+            char next = sql.charAt(offset + nameLen);
+            if (Character.isLetterOrDigit(next) || next == '_' || next == '$' || next == '#') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int skipWhitespace(String sql, int index) {
+        int len = sql.length();
+        int i = index;
+        while (i < len && Character.isWhitespace(sql.charAt(i))) {
+            i++;
+        }
+        return i;
+    }
+
+    private int findMatchingParenthesis(String sql, int openIndex) {
+        int len = sql.length();
+        int depth = 0;
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = openIndex; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    i++;
+                } else {
+                    inSingle = !inSingle;
+                }
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i++;
+                } else {
+                    inDouble = !inDouble;
+                }
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+                if (depth < 0) {
+                    return -1;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private List<String> splitTopLevelArguments(String input) {
+        List<String> parts = new ArrayList<>();
+        int len = input.length();
+        int start = 0;
+        int depth = 0;
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = 0; i < len; i++) {
+            char c = input.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && input.charAt(i + 1) == '\'') {
+                    i++;
+                } else {
+                    inSingle = !inSingle;
+                }
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && input.charAt(i + 1) == '"') {
+                    i++;
+                } else {
+                    inDouble = !inDouble;
+                }
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (c == ',' && depth == 0) {
+                parts.add(input.substring(start, i));
+                start = i + 1;
+            }
+        }
+        parts.add(input.substring(start));
+        return parts;
     }
 
     private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {

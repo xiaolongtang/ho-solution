@@ -158,6 +158,33 @@ class OracleLoaderServiceTest {
         assertEquals("world", clobObjectValue);
     }
 
+    @Test
+    void translateViewSqlUppercasesIdentifiersAndRewritesNvl2() throws Exception {
+        OracleLoaderService loader = new OracleLoaderService(
+                new JdbcTemplate(newH2DataSource("target" + randomSuffix())),
+                newH2DataSource("oracle" + randomSuffix()),
+                "TEST",
+                1,
+                100,
+                1,
+                ""
+        );
+
+        Method method = OracleLoaderService.class.getDeclaredMethod("translateViewSql", String.class);
+        method.setAccessible(true);
+
+        String oracleSql = "select emp.id, nvl2(emp.name, emp.name, 'n/a') name_copy, nvl2(emp.dept_id, emp.dept_id, 0) dept_id " +
+                "from test.emp emp where nvl2(emp.status, emp.status, 'A') = 'A'";
+
+        String translated = (String) method.invoke(loader, oracleSql);
+
+        String expected = "SELECT EMP.ID, CASE WHEN EMP.NAME IS NOT NULL THEN EMP.NAME ELSE 'n/a' END NAME_COPY, " +
+                "CASE WHEN EMP.DEPT_ID IS NOT NULL THEN EMP.DEPT_ID ELSE 0 END DEPT_ID FROM EMP EMP WHERE " +
+                "CASE WHEN EMP.STATUS IS NOT NULL THEN EMP.STATUS ELSE 'A' END = 'A'";
+
+        assertEquals(expected, translated);
+    }
+
     private static DriverManagerDataSource newH2DataSource(String dbName) {
         DriverManagerDataSource ds = new DriverManagerDataSource();
         ds.setDriverClassName("org.h2.Driver");
