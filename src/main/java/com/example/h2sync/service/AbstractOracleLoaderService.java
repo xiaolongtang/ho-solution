@@ -509,7 +509,8 @@ public abstract class AbstractOracleLoaderService {
     }
 
     private String replaceOracleSpecificFunctions(String sql) {
-        return replaceNvl2(sql);
+        String replaced = replaceNvl2(sql);
+        return moveJoinFiltersToWhere(replaced);
     }
 
     private String replaceNvl2(String sql) {
@@ -673,6 +674,454 @@ public abstract class AbstractOracleLoaderService {
         }
         parts.add(input.substring(start));
         return parts;
+    }
+
+    private String moveJoinFiltersToWhere(String sql) {
+        StringBuilder builder = new StringBuilder(sql);
+        int offset = 0;
+        while (offset < builder.length()) {
+            int joinIndex = findKeywordOutsideQuotes(builder, offset, "JOIN");
+            if (joinIndex == -1) {
+                break;
+            }
+            int depth = calculateDepth(builder, joinIndex);
+            int onIndex = findKeywordOutsideQuotes(builder, joinIndex, "ON");
+            if (onIndex == -1) {
+                offset = joinIndex + 4;
+                continue;
+            }
+            int clauseStart = skipWhitespace(builder, onIndex + 2);
+            int clauseEnd = findEndOfOnClause(builder, clauseStart);
+            if (clauseEnd == -1) {
+                offset = clauseStart;
+                continue;
+            }
+            String onClause = builder.substring(clauseStart, clauseEnd).trim();
+            if (onClause.isEmpty()) {
+                offset = clauseEnd;
+                continue;
+            }
+            List<String> conditions = splitTopLevelConditions(onClause);
+            if (conditions.size() <= 1) {
+                offset = clauseEnd;
+                continue;
+            }
+            String primary = conditions.get(0).trim();
+            List<String> extras = new ArrayList<>();
+            for (int i = 1; i < conditions.size(); i++) {
+                String cond = conditions.get(i).trim();
+                if (!cond.isEmpty()) {
+                    extras.add(cond);
+                }
+            }
+            if (extras.isEmpty()) {
+                offset = clauseEnd;
+                continue;
+            }
+            builder.replace(clauseStart, clauseEnd, primary);
+            int afterPrimary = clauseStart + primary.length();
+            String extrasClause = String.join(" AND ", extras);
+            int whereIndex = findKeywordAtDepth(builder, afterPrimary, depth, "WHERE");
+            if (whereIndex != -1) {
+                int whereEnd = findEndOfWhereClause(builder, whereIndex + 5, depth);
+                String addition = " AND " + extrasClause;
+                builder.insert(whereEnd, addition);
+                offset = whereEnd + addition.length();
+            } else {
+                int boundary = findNextClauseBoundary(builder, afterPrimary, depth);
+                String addition = " WHERE " + extrasClause;
+                builder.insert(boundary, addition);
+                offset = boundary + addition.length();
+            }
+        }
+        return builder.toString();
+    }
+
+    private List<String> splitTopLevelConditions(String input) {
+        List<String> parts = new ArrayList<>();
+        int len = input.length();
+        int start = 0;
+        int depth = 0;
+        boolean inSingle = false;
+        boolean inDouble = false;
+        int i = 0;
+        while (i < len) {
+            char c = input.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && input.charAt(i + 1) == '\'') {
+                    i += 2;
+                    continue;
+                }
+                inSingle = !inSingle;
+                i++;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && input.charAt(i + 1) == '"') {
+                    i += 2;
+                    continue;
+                }
+                inDouble = !inDouble;
+                i++;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                i++;
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth = Math.max(0, depth - 1);
+            } else if (depth == 0 && matchesKeyword(input, i, "AND") && !isPartOfBetween(input, start, i)) {
+                int end = i;
+                parts.add(input.substring(start, end));
+                i += 3;
+                while (i < len && Character.isWhitespace(input.charAt(i))) {
+                    i++;
+                }
+                start = i;
+                continue;
+            }
+            i++;
+        }
+        parts.add(input.substring(start));
+        return parts;
+    }
+
+    private boolean isPartOfBetween(CharSequence sql, int sectionStart, int andOffset) {
+        int i = andOffset - 1;
+        while (i >= sectionStart && Character.isWhitespace(sql.charAt(i))) {
+            i--;
+        }
+        int end = i + 1;
+        while (i >= sectionStart && isIdentifierPart(sql.charAt(i))) {
+            i--;
+        }
+        int start = i + 1;
+        if (start < end) {
+            String token = sql.subSequence(start, end).toString().toUpperCase(Locale.ROOT);
+            if ("BETWEEN".equals(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int findKeywordOutsideQuotes(CharSequence sql, int start, String keyword) {
+        int len = sql.length();
+        int klen = keyword.length();
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = start; i <= len - klen; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    i++;
+                    continue;
+                }
+                inSingle = !inSingle;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                inDouble = !inDouble;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (matchesKeyword(sql, i, keyword)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int calculateDepth(CharSequence sql, int index) {
+        int depth = 0;
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = 0; i < index; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < index && sql.charAt(i + 1) == '\'') {
+                    i++;
+                    continue;
+                }
+                inSingle = !inSingle;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < index && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                inDouble = !inDouble;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth = Math.max(0, depth - 1);
+            }
+        }
+        return depth;
+    }
+
+    private int findEndOfOnClause(CharSequence sql, int start) {
+        int len = sql.length();
+        int depth = 0;
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = start; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    i++;
+                    continue;
+                }
+                inSingle = !inSingle;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                inDouble = !inDouble;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                if (depth == 0) {
+                    return i;
+                }
+                depth--;
+            } else if (depth == 0) {
+                if (matchesKeyword(sql, i, "WHERE")
+                        || matchesKeyword(sql, i, "GROUP")
+                        || matchesKeyword(sql, i, "HAVING")
+                        || matchesKeyword(sql, i, "ORDER")
+                        || matchesKeyword(sql, i, "CONNECT")
+                        || matchesKeyword(sql, i, "START")
+                        || matchesKeyword(sql, i, "UNION")
+                        || matchesKeyword(sql, i, "INTERSECT")
+                        || matchesKeyword(sql, i, "MINUS")
+                        || matchesKeyword(sql, i, "FETCH")
+                        || matchesKeyword(sql, i, "FOR")
+                        || matchesKeyword(sql, i, "MODEL")
+                        || matchesKeyword(sql, i, "WINDOW")) {
+                    return i;
+                }
+            }
+        }
+        return len;
+    }
+
+    private int findKeywordAtDepth(CharSequence sql, int start, int targetDepth, String keyword) {
+        int len = sql.length();
+        boolean inSingle = false;
+        boolean inDouble = false;
+        int depth = calculateDepth(sql, start);
+        for (int i = start; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    i++;
+                    continue;
+                }
+                inSingle = !inSingle;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                inDouble = !inDouble;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+                continue;
+            }
+            if (c == ')') {
+                depth = Math.max(0, depth - 1);
+                if (depth < targetDepth) {
+                    return -1;
+                }
+                continue;
+            }
+            if (depth == targetDepth && matchesKeyword(sql, i, keyword)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int findEndOfWhereClause(CharSequence sql, int start, int targetDepth) {
+        int len = sql.length();
+        boolean inSingle = false;
+        boolean inDouble = false;
+        int depth = calculateDepth(sql, start);
+        for (int i = start; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    i++;
+                    continue;
+                }
+                inSingle = !inSingle;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                inDouble = !inDouble;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+                continue;
+            }
+            if (c == ')') {
+                depth = Math.max(0, depth - 1);
+                if (depth < targetDepth) {
+                    return i;
+                }
+                continue;
+            }
+            if (depth == targetDepth && (matchesKeyword(sql, i, "GROUP")
+                    || matchesKeyword(sql, i, "HAVING")
+                    || matchesKeyword(sql, i, "ORDER")
+                    || matchesKeyword(sql, i, "UNION")
+                    || matchesKeyword(sql, i, "INTERSECT")
+                    || matchesKeyword(sql, i, "MINUS")
+                    || matchesKeyword(sql, i, "CONNECT")
+                    || matchesKeyword(sql, i, "START")
+                    || matchesKeyword(sql, i, "FETCH")
+                    || matchesKeyword(sql, i, "FOR")
+                    || matchesKeyword(sql, i, "MODEL")
+                    || matchesKeyword(sql, i, "WINDOW"))) {
+                return i;
+            }
+        }
+        return len;
+    }
+
+    private int findNextClauseBoundary(CharSequence sql, int start, int targetDepth) {
+        int len = sql.length();
+        boolean inSingle = false;
+        boolean inDouble = false;
+        int depth = calculateDepth(sql, start);
+        for (int i = start; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDouble) {
+                if (inSingle && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    i++;
+                    continue;
+                }
+                inSingle = !inSingle;
+                continue;
+            }
+            if (c == '"' && !inSingle) {
+                if (inDouble && i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i++;
+                    continue;
+                }
+                inDouble = !inDouble;
+                continue;
+            }
+            if (inSingle || inDouble) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+                continue;
+            }
+            if (c == ')') {
+                depth = Math.max(0, depth - 1);
+                if (depth < targetDepth) {
+                    return i;
+                }
+                continue;
+            }
+            if (depth == targetDepth && (matchesKeyword(sql, i, "WHERE")
+                    || matchesKeyword(sql, i, "GROUP")
+                    || matchesKeyword(sql, i, "HAVING")
+                    || matchesKeyword(sql, i, "ORDER")
+                    || matchesKeyword(sql, i, "UNION")
+                    || matchesKeyword(sql, i, "INTERSECT")
+                    || matchesKeyword(sql, i, "MINUS")
+                    || matchesKeyword(sql, i, "CONNECT")
+                    || matchesKeyword(sql, i, "START")
+                    || matchesKeyword(sql, i, "FETCH")
+                    || matchesKeyword(sql, i, "FOR")
+                    || matchesKeyword(sql, i, "MODEL")
+                    || matchesKeyword(sql, i, "WINDOW"))) {
+                return i;
+            }
+        }
+        return len;
+    }
+
+    private boolean matchesKeyword(CharSequence sql, int offset, String keyword) {
+        int len = sql.length();
+        int klen = keyword.length();
+        if (offset < 0 || offset + klen > len) {
+            return false;
+        }
+        for (int i = 0; i < klen; i++) {
+            char c = sql.charAt(offset + i);
+            if (Character.toUpperCase(c) != keyword.charAt(i)) {
+                return false;
+            }
+        }
+        if (offset > 0) {
+            char prev = sql.charAt(offset - 1);
+            if (isIdentifierPart(prev)) {
+                return false;
+            }
+        }
+        if (offset + klen < len) {
+            char next = sql.charAt(offset + klen);
+            if (isIdentifierPart(next)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int skipWhitespace(CharSequence sql, int index) {
+        int len = sql.length();
+        int i = index;
+        while (i < len && Character.isWhitespace(sql.charAt(i))) {
+            i++;
+        }
+        return i;
+    }
+
+    private boolean isIdentifierPart(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$' || c == '#';
     }
 
     private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
