@@ -67,7 +67,10 @@ public class OracleSampleLoaderService extends AbstractOracleLoaderService {
 
     @Override
     protected String buildTableSelectSql(String oracleQualifiedTable, String table) {
-        return "SELECT * FROM " + oracleQualifiedTable + " FETCH FIRST " + rowLimit + " ROWS ONLY";
+        if (rowLimit > 0) {
+            return "SELECT * FROM " + oracleQualifiedTable + " WHERE ROWNUM <= " + rowLimit;
+        }
+        return super.buildTableSelectSql(oracleQualifiedTable, table);
     }
 
     public void runSampleLoad() {
