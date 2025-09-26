@@ -82,7 +82,6 @@ class OracleLoaderServiceTest {
         );
 
         Method method = OracleLoaderService.class.getDeclaredMethod("mapType", int.class, int.class, int.class);
-        method.setAccessible(true);
 
         String decimalType = (String) method.invoke(loader, Types.NUMERIC, 0, -127);
         assertEquals("DECIMAL(38,12)", decimalType);
@@ -103,10 +102,6 @@ class OracleLoaderServiceTest {
                 ""
         );
 
-        Method method = OracleLoaderService.class.getDeclaredMethod(
-                "readColumnValue", ResultSet.class, ResultSetMetaData.class, int.class);
-        method.setAccessible(true);
-
         byte[] blobData = new byte[]{0x01, 0x02, 0x03};
 
         ResultSet blobRs = mock(ResultSet.class);
@@ -114,7 +109,7 @@ class OracleLoaderServiceTest {
         when(blobMeta.getColumnType(1)).thenReturn(Types.BLOB);
         when(blobRs.getBytes(1)).thenReturn(blobData);
         when(blobRs.wasNull()).thenReturn(false);
-        Object blobValue = method.invoke(loader, blobRs, blobMeta, 1);
+        Object blobValue = OracleJdbcValueConverter.readColumnValue(blobRs, blobMeta, 1, loader.log);
         assertArrayEquals(blobData, (byte[]) blobValue);
 
         ResultSet nullBlobRs = mock(ResultSet.class);
@@ -122,7 +117,7 @@ class OracleLoaderServiceTest {
         when(nullBlobMeta.getColumnType(1)).thenReturn(Types.BLOB);
         when(nullBlobRs.getBytes(1)).thenReturn(null);
         when(nullBlobRs.wasNull()).thenReturn(true);
-        Object nullBlobValue = method.invoke(loader, nullBlobRs, nullBlobMeta, 1);
+        Object nullBlobValue = OracleJdbcValueConverter.readColumnValue(nullBlobRs, nullBlobMeta, 1, loader.log);
         assertNull(nullBlobValue);
 
         ResultSet blobObjectRs = mock(ResultSet.class);
@@ -130,7 +125,7 @@ class OracleLoaderServiceTest {
         when(blobObjectMeta.getColumnType(1)).thenReturn(Types.OTHER);
         SerialBlob serialBlob = new SerialBlob(blobData);
         when(blobObjectRs.getObject(1)).thenReturn(serialBlob);
-        Object blobObjectValue = method.invoke(loader, blobObjectRs, blobObjectMeta, 1);
+        Object blobObjectValue = OracleJdbcValueConverter.readColumnValue(blobObjectRs, blobObjectMeta, 1, loader.log);
         assertArrayEquals(blobData, (byte[]) blobObjectValue);
 
         ResultSet clobRs = mock(ResultSet.class);
@@ -138,7 +133,7 @@ class OracleLoaderServiceTest {
         when(clobMeta.getColumnType(1)).thenReturn(Types.CLOB);
         when(clobRs.getString(1)).thenReturn("hello");
         when(clobRs.wasNull()).thenReturn(false);
-        Object clobValue = method.invoke(loader, clobRs, clobMeta, 1);
+        Object clobValue = OracleJdbcValueConverter.readColumnValue(clobRs, clobMeta, 1, loader.log);
         assertEquals("hello", clobValue);
 
         ResultSet nullClobRs = mock(ResultSet.class);
@@ -146,7 +141,7 @@ class OracleLoaderServiceTest {
         when(nullClobMeta.getColumnType(1)).thenReturn(Types.CLOB);
         when(nullClobRs.getString(1)).thenReturn(null);
         when(nullClobRs.wasNull()).thenReturn(true);
-        Object nullClobValue = method.invoke(loader, nullClobRs, nullClobMeta, 1);
+        Object nullClobValue = OracleJdbcValueConverter.readColumnValue(nullClobRs, nullClobMeta, 1, loader.log);
         assertNull(nullClobValue);
 
         ResultSet clobObjectRs = mock(ResultSet.class);
@@ -154,7 +149,7 @@ class OracleLoaderServiceTest {
         when(clobObjectMeta.getColumnType(1)).thenReturn(Types.OTHER);
         SerialClob serialClob = new SerialClob("world".toCharArray());
         when(clobObjectRs.getObject(1)).thenReturn(serialClob);
-        Object clobObjectValue = method.invoke(loader, clobObjectRs, clobObjectMeta, 1);
+        Object clobObjectValue = OracleJdbcValueConverter.readColumnValue(clobObjectRs, clobObjectMeta, 1, loader.log);
         assertEquals("world", clobObjectValue);
     }
 
@@ -170,13 +165,11 @@ class OracleLoaderServiceTest {
                 ""
         );
 
-        Method method = OracleLoaderService.class.getDeclaredMethod("translateViewSql", String.class);
-        method.setAccessible(true);
-
         String oracleSql = "select emp.id, nvl2(emp.name, emp.name, 'n/a') name_copy, nvl2(emp.dept_id, emp.dept_id, 0) dept_id " +
                 "from test.emp emp where nvl2(emp.status, emp.status, 'A') = 'A'";
 
-        String translated = (String) method.invoke(loader, oracleSql);
+        OracleViewSqlTranslator translator = new OracleViewSqlTranslator("TEST");
+        String translated = translator.translate(oracleSql);
 
         String expected = "SELECT EMP.ID, CASE WHEN EMP.NAME IS NOT NULL THEN EMP.NAME ELSE 'n/a' END NAME_COPY, " +
                 "CASE WHEN EMP.DEPT_ID IS NOT NULL THEN EMP.DEPT_ID ELSE 0 END DEPT_ID FROM EMP EMP WHERE " +
@@ -197,13 +190,11 @@ class OracleLoaderServiceTest {
                 ""
         );
 
-        Method method = OracleLoaderService.class.getDeclaredMethod("translateViewSql", String.class);
-        method.setAccessible(true);
-
         String oracleSql = "select value, type, other.value value_alias from test.sample other " +
                 "where type = 'A' and other.type > 0";
 
-        String translated = (String) method.invoke(loader, oracleSql);
+        OracleViewSqlTranslator translator = new OracleViewSqlTranslator("TEST");
+        String translated = translator.translate(oracleSql);
 
         String expected = "SELECT \"VALUE\", \"TYPE\", OTHER.\"VALUE\" VALUE_ALIAS FROM SAMPLE OTHER " +
                 "WHERE \"TYPE\" = 'A' AND OTHER.\"TYPE\" > 0";
