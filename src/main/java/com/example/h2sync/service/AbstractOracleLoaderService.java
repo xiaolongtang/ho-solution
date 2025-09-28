@@ -2,12 +2,14 @@ package com.example.h2sync.service;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.io.Reader;
+import java.math.BigDecimal;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -26,6 +28,7 @@ public abstract class AbstractOracleLoaderService {
     protected final Set<String> blacklist;
     protected final String oracleSchema;
     private final OracleViewSqlTranslator viewSqlTranslator;
+    private final MigrationReportPrinter reportPrinter;
 
     protected AbstractOracleLoaderService(
             JdbcTemplate h2,
@@ -43,6 +46,14 @@ public abstract class AbstractOracleLoaderService {
         this.maxRetries = maxRetries;
         this.oracleSchema = schema != null ? schema.toUpperCase(Locale.ROOT) : null;
         this.viewSqlTranslator = new OracleViewSqlTranslator(this.oracleSchema);
+        this.reportPrinter = new MigrationReportPrinter(
+                this.log,
+                this.h2,
+                this.oracleDs,
+                this::quoteIdentifier,
+                this::isBlacklisted,
+                this.oracleSchema
+        );
 
         this.blacklist = Arrays.stream((blacklistCsv == null ? "" : blacklistCsv).split(","))
                 .map(String::trim)
@@ -116,6 +127,12 @@ public abstract class AbstractOracleLoaderService {
             pool.shutdown();
         }
         long took = System.currentTimeMillis() - t0;
+        try {
+            reportPrinter.printReport(tables, views, sequences);
+        } catch (Exception ex) {
+            log.warn("Failed to generate migration report: {}", ex.toString());
+            log.debug("Migration report failure", ex);
+        }
         log.info("{} completed in {} ms", jobName, took);
     }
 
@@ -316,7 +333,7 @@ public abstract class AbstractOracleLoaderService {
     private void syncSequence(Map<String, Object> seq) {
         String name = ((String) seq.get("SEQUENCE_NAME")).toUpperCase(Locale.ROOT);
         long increment = ((Number) seq.get("INCREMENT_BY")).longValue();
-        java.math.BigDecimal lastNumber = (java.math.BigDecimal) seq.get("LAST_NUMBER");
+        BigDecimal lastNumber = (BigDecimal) seq.get("LAST_NUMBER");
         String drop = "DROP SEQUENCE IF EXISTS \"" + name + "\"";
         String create = "CREATE SEQUENCE IF NOT EXISTS \"" + name + "\" START WITH " + lastNumber.toPlainString() + " INCREMENT BY " + increment;
         String alter = "ALTER SEQUENCE \"" + name + "\" RESTART WITH " + lastNumber.toPlainString();
@@ -695,6 +712,5 @@ public abstract class AbstractOracleLoaderService {
             throw new RuntimeException("Bulk insert failed for target " + target, e);
         }
     }
-
 
 }
