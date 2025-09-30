@@ -2,6 +2,7 @@ package com.example.h2sync.service;
 
 import org.slf4j.Logger;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import javax.sql.DataSource;
@@ -22,6 +23,15 @@ import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
 class MigrationReportPrinter {
+
+    private static final List<String> H2_SEQUENCE_VALUE_COLUMNS = List.of(
+            "CURRENT_VALUE",
+            "VALUE",
+            "LAST_VALUE",
+            "BASE_VALUE",
+            "START_VALUE",
+            "START_WITH"
+    );
 
     private final Logger log;
     private final JdbcTemplate h2;
@@ -163,17 +173,34 @@ class MigrationReportPrinter {
     }
 
     private NumericResult fetchH2SequenceValue(String sequence) {
-        String sql = "SELECT COALESCE(\"CURRENT_VALUE\", \"START_VALUE\") FROM INFORMATION_SCHEMA.SEQUENCES " +
+        String sql = "SELECT * FROM INFORMATION_SCHEMA.SEQUENCES " +
                 "WHERE UPPER(SEQUENCE_NAME) = ? AND UPPER(SEQUENCE_SCHEMA) = UPPER(SCHEMA())";
         try {
-            BigDecimal value = h2.queryForObject(sql, BigDecimal.class, sequence.toUpperCase(Locale.ROOT));
+            Map<String, Object> row = h2.queryForMap(sql, sequence.toUpperCase(Locale.ROOT));
+            BigDecimal value = extractH2SequenceValue(row);
             if (value == null) {
-                return NumericResult.error("NOT FOUND");
+                return NumericResult.error("VALUE NOT AVAILABLE");
             }
             return NumericResult.success(value);
+        } catch (EmptyResultDataAccessException ex) {
+            return NumericResult.error("NOT FOUND");
         } catch (DataAccessException ex) {
             return NumericResult.error(normalizeMessage(truncate(extractMessage(ex), 60)));
         }
+    }
+
+    private BigDecimal extractH2SequenceValue(Map<String, Object> row) {
+        for (String column : H2_SEQUENCE_VALUE_COLUMNS) {
+            if (!row.containsKey(column)) {
+                continue;
+            }
+            Object value = row.get(column);
+            if (value == null) {
+                continue;
+            }
+            return toBigDecimal(value);
+        }
+        return null;
     }
 
     private BigDecimal toBigDecimal(Object value) {
