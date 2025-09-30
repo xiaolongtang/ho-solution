@@ -163,8 +163,8 @@ class MigrationReportPrinter {
     }
 
     private NumericResult fetchH2SequenceValue(String sequence) {
-        String sql = "SELECT COALESCE(CURRENT_VALUE, START_VALUE) FROM INFORMATION_SCHEMA.SEQUENCES " +
-                "WHERE UPPER(SEQUENCE_NAME) = ? AND SEQUENCE_SCHEMA = SCHEMA()";
+        String sql = "SELECT COALESCE(\"CURRENT_VALUE\", \"START_VALUE\") FROM INFORMATION_SCHEMA.SEQUENCES " +
+                "WHERE UPPER(SEQUENCE_NAME) = ? AND UPPER(SEQUENCE_SCHEMA) = UPPER(SCHEMA())";
         try {
             BigDecimal value = h2.queryForObject(sql, BigDecimal.class, sequence.toUpperCase(Locale.ROOT));
             if (value == null) {
