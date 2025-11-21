@@ -17,6 +17,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.Locale;
@@ -81,13 +82,17 @@ class OracleLoaderServiceTest {
                 ""
         );
 
-        Method method = OracleLoaderService.class.getDeclaredMethod("mapType", int.class, int.class, int.class);
+        Method method = OracleLoaderService.class.getDeclaredMethod("mapType", int.class, int.class, int.class, int.class);
+        method.setAccessible(true);
 
-        String decimalType = (String) method.invoke(loader, Types.NUMERIC, 0, -127);
+        String decimalType = (String) method.invoke(loader, Types.NUMERIC, 0, -127, 0);
         assertEquals("DECIMAL(38,12)", decimalType);
 
-        String integerType = (String) method.invoke(loader, Types.NUMERIC, 5, 0);
+        String integerType = (String) method.invoke(loader, Types.NUMERIC, 5, 0, 0);
         assertEquals("INTEGER", integerType);
+
+        String varcharType = (String) method.invoke(loader, Types.VARCHAR, 0, 0, 2000);
+        assertEquals("VARCHAR(2000)", varcharType);
     }
 
     @Test
@@ -151,6 +156,29 @@ class OracleLoaderServiceTest {
         when(clobObjectRs.getObject(1)).thenReturn(serialClob);
         Object clobObjectValue = OracleJdbcValueConverter.readColumnValue(clobObjectRs, clobObjectMeta, 1, loader.log);
         assertEquals("world", clobObjectValue);
+    }
+
+    @Test
+    void readColumnValueConvertsTemporalTypesWhenGetTimestampFails() throws Exception {
+        OracleLoaderService loader = new OracleLoaderService(
+                new JdbcTemplate(newH2DataSource("target" + randomSuffix())),
+                newH2DataSource("oracle" + randomSuffix()),
+                "TEST",
+                1,
+                100,
+                1,
+                ""
+        );
+
+        ResultSet rs = mock(ResultSet.class);
+        ResultSetMetaData md = mock(ResultSetMetaData.class);
+        when(md.getColumnType(1)).thenReturn(Types.TIMESTAMP);
+        when(rs.getTimestamp(1)).thenThrow(new SQLException("simulated"));
+        when(rs.getObject(1)).thenReturn(java.time.LocalDateTime.of(2024, 2, 3, 4, 5, 6));
+
+        Object converted = OracleJdbcValueConverter.readColumnValue(rs, md, 1, loader.log);
+
+        assertEquals(Timestamp.valueOf("2024-02-03 04:05:06"), converted);
     }
 
     @Test
