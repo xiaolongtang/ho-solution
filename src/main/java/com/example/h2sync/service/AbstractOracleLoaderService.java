@@ -29,6 +29,7 @@ public abstract class AbstractOracleLoaderService {
     protected final String oracleSchema;
     private final OracleViewSqlTranslator viewSqlTranslator;
     private final MigrationReportPrinter reportPrinter;
+    private static final int H2_MAX_VARCHAR_LENGTH = 1_000_000_000;
 
     protected AbstractOracleLoaderService(
             JdbcTemplate h2,
@@ -352,7 +353,9 @@ public abstract class AbstractOracleLoaderService {
              ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
             log.debug("Prepared metadata for {} using Oracle connection {}", src, oconn);
             List<String> primaryKeys = fetchPrimaryKeys(table, oconn);
-            createTargetTableFrom(rs.getMetaData(), tgt, primaryKeys);
+            Map<String, Boolean> nonNullableColumns = fetchNonNullableColumns(table, oconn);
+            List<List<String>> uniqueConstraints = fetchUniqueConstraints(table, oconn);
+            createTargetTableFrom(rs.getMetaData(), tgt, primaryKeys, nonNullableColumns, uniqueConstraints);
         } catch (SQLException e) {
             throw new RuntimeException("Prepare target table failed for " + src, e);
         }
@@ -572,7 +575,13 @@ public abstract class AbstractOracleLoaderService {
         }
     }
 
-    private void createTargetTableFrom(ResultSetMetaData md, String target, List<String> primaryKeys) throws SQLException {
+    private void createTargetTableFrom(
+            ResultSetMetaData md,
+            String target,
+            List<String> primaryKeys,
+            Map<String, Boolean> nonNullableColumns,
+            List<List<String>> uniqueConstraints
+    ) throws SQLException {
         String drop = "DROP TABLE IF EXISTS " + target + " CASCADE";
         h2.execute(drop);
         StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(target).append(" (");
@@ -582,7 +591,14 @@ public abstract class AbstractOracleLoaderService {
             int type = md.getColumnType(i);
             int precision = md.getPrecision(i);
             int scale = md.getScale(i);
-            ddl.append("\"").append(name).append("\" ").append(mapType(type, precision, scale));
+            int displaySize = md.getColumnDisplaySize(i);
+            boolean notNull = Boolean.TRUE.equals(nonNullableColumns.get(name))
+                    || md.isNullable(i) == ResultSetMetaData.columnNoNulls
+                    || (primaryKeys != null && primaryKeys.contains(name));
+            ddl.append("\"").append(name).append("\" ").append(mapType(type, precision, scale, displaySize));
+            if (notNull) {
+                ddl.append(" NOT NULL");
+            }
         }
         if (primaryKeys != null && !primaryKeys.isEmpty()) {
             ddl.append(", PRIMARY KEY (");
@@ -590,6 +606,16 @@ public abstract class AbstractOracleLoaderService {
                     .map(this::quoteIdentifier)
                     .collect(Collectors.joining(", ")));
             ddl.append(")");
+        }
+        if (uniqueConstraints != null && !uniqueConstraints.isEmpty()) {
+            for (List<String> unique : uniqueConstraints) {
+                if (unique.isEmpty()) continue;
+                ddl.append(", UNIQUE (");
+                ddl.append(unique.stream()
+                        .map(this::quoteIdentifier)
+                        .collect(Collectors.joining(", ")));
+                ddl.append(")");
+            }
         }
         ddl.append(")");
         h2.execute(ddl.toString());
@@ -615,7 +641,61 @@ public abstract class AbstractOracleLoaderService {
         }
     }
 
-    private String mapType(int jdbcType, int precision, int scale) {
+    private Map<String, Boolean> fetchNonNullableColumns(String table, Connection oracleConnection) throws SQLException {
+        if (oracleSchema == null || oracleSchema.isBlank()) {
+            return Collections.emptyMap();
+        }
+
+        String sql = "SELECT column_name, nullable FROM all_tab_columns WHERE owner = ? AND table_name = ?";
+        try (PreparedStatement ps = oracleConnection.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                Map<String, Boolean> nullable = new HashMap<>();
+                while (rs.next()) {
+                    String column = rs.getString("COLUMN_NAME");
+                    String nullableFlag = rs.getString("NULLABLE");
+                    if (column != null) {
+                        nullable.put(column, "N".equalsIgnoreCase(nullableFlag));
+                    }
+                }
+                return nullable;
+            }
+        }
+    }
+
+    private List<List<String>> fetchUniqueConstraints(String table, Connection oracleConnection) throws SQLException {
+        if (oracleSchema == null || oracleSchema.isBlank()) {
+            return Collections.emptyList();
+        }
+
+        String sql = "SELECT cons.constraint_name, cols.column_name, cols.position " +
+                "FROM all_constraints cons " +
+                "JOIN all_cons_columns cols ON cons.owner = cols.owner AND cons.constraint_name = cols.constraint_name " +
+                "AND cons.table_name = cols.table_name " +
+                "WHERE cons.constraint_type = 'U' AND cons.owner = ? AND cons.table_name = ? " +
+                "ORDER BY cons.constraint_name, cols.position";
+
+        Map<String, List<String>> constraints = new LinkedHashMap<>();
+        try (PreparedStatement ps = oracleConnection.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String constraintName = rs.getString("CONSTRAINT_NAME");
+                    String column = rs.getString("COLUMN_NAME");
+                    if (constraintName == null || column == null) {
+                        continue;
+                    }
+                    constraints.computeIfAbsent(constraintName, k -> new ArrayList<>()).add(column);
+                }
+            }
+        }
+        return new ArrayList<>(constraints.values());
+    }
+
+    private String mapType(int jdbcType, int precision, int scale, int displaySize) {
+        int effectivePrecision = precision > 0 ? precision : displaySize;
         switch (jdbcType) {
             case Types.INTEGER:
             case Types.SMALLINT:
@@ -667,8 +747,8 @@ public abstract class AbstractOracleLoaderService {
             case Types.CHAR:
             case Types.VARCHAR:
             default:
-                int len = precision > 0 ? precision : 255;
-                len = Math.min(len, 10000);
+                int len = effectivePrecision > 0 ? effectivePrecision : 255;
+                len = Math.min(len, H2_MAX_VARCHAR_LENGTH);
                 return "VARCHAR(" + len + ")";
         }
     }
