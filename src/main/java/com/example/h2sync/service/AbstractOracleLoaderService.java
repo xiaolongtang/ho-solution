@@ -351,7 +351,8 @@ public abstract class AbstractOracleLoaderService {
              Statement s = oconn.createStatement();
              ResultSet rs = s.executeQuery("SELECT * FROM " + src + " WHERE 1=0")) {
             log.debug("Prepared metadata for {} using Oracle connection {}", src, oconn);
-            createTargetTableFrom(rs.getMetaData(), tgt);
+            List<String> primaryKeys = fetchPrimaryKeys(table, oconn);
+            createTargetTableFrom(rs.getMetaData(), tgt, primaryKeys);
         } catch (SQLException e) {
             throw new RuntimeException("Prepare target table failed for " + src, e);
         }
@@ -571,7 +572,7 @@ public abstract class AbstractOracleLoaderService {
         }
     }
 
-    private void createTargetTableFrom(ResultSetMetaData md, String target) throws SQLException {
+    private void createTargetTableFrom(ResultSetMetaData md, String target, List<String> primaryKeys) throws SQLException {
         String drop = "DROP TABLE IF EXISTS " + target + " CASCADE";
         h2.execute(drop);
         StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(target).append(" (");
@@ -583,8 +584,35 @@ public abstract class AbstractOracleLoaderService {
             int scale = md.getScale(i);
             ddl.append("\"").append(name).append("\" ").append(mapType(type, precision, scale));
         }
+        if (primaryKeys != null && !primaryKeys.isEmpty()) {
+            ddl.append(", PRIMARY KEY (");
+            ddl.append(primaryKeys.stream()
+                    .map(this::quoteIdentifier)
+                    .collect(Collectors.joining(", ")));
+            ddl.append(")");
+        }
         ddl.append(")");
         h2.execute(ddl.toString());
+    }
+
+    private List<String> fetchPrimaryKeys(String table, Connection oracleConnection) throws SQLException {
+        String sql = "SELECT cols.column_name " +
+                "FROM all_constraints cons " +
+                "JOIN all_cons_columns cols ON cons.owner = cols.owner AND cons.constraint_name = cols.constraint_name " +
+                "AND cons.table_name = cols.table_name " +
+                "WHERE cons.constraint_type = 'P' AND cons.owner = ? AND cons.table_name = ? " +
+                "ORDER BY cols.position";
+        try (PreparedStatement ps = oracleConnection.prepareStatement(sql)) {
+            ps.setString(1, oracleSchema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<String> columns = new ArrayList<>();
+                while (rs.next()) {
+                    columns.add(rs.getString("COLUMN_NAME"));
+                }
+                return columns;
+            }
+        }
     }
 
     private String mapType(int jdbcType, int precision, int scale) {
