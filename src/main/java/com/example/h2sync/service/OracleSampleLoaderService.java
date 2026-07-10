@@ -2,6 +2,7 @@ package com.example.h2sync.service;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.stereotype.Service;
@@ -9,6 +10,7 @@ import org.springframework.stereotype.Service;
 import javax.sql.DataSource;
 
 @Service
+@ConditionalOnProperty(prefix = "sample.loader", name = "enabled", havingValue = "true")
 public class OracleSampleLoaderService extends AbstractOracleLoaderService {
 
     private final int rowLimit;
