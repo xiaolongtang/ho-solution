@@ -2,12 +2,14 @@ package com.example.h2sync.service;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
 
 @Service
+@ConditionalOnProperty(prefix = "loader", name = "enabled", havingValue = "true")
 public class OracleLoaderService extends AbstractOracleLoaderService {
 
     @Autowired

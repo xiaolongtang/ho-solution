@@ -3,6 +3,7 @@ package com.example.h2sync.controller;
 import com.example.h2sync.scheduler.OracleSyncScheduler;
 import com.example.h2sync.scheduler.OracleSyncScheduler.TriggerResult;
 import io.swagger.v3.oas.annotations.Operation;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/loader")
+@ConditionalOnProperty(prefix = "loader", name = "enabled", havingValue = "true")
 public class LoaderController {
 
     private final OracleSyncScheduler scheduler;

@@ -14,8 +14,30 @@ oracle:
   password: YOUR_ORACLE_PASSWORD
   schema: YOUR_ORACLE_SCHEMA
 
+postgresql:
+  url: jdbc:postgresql://YOUR_POSTGRESQL_HOST:5432/YOUR_DATABASE?reWriteBatchedInserts=true
+  username: YOUR_POSTGRESQL_USER
+  password: YOUR_POSTGRESQL_PASSWORD
+  driver-class: org.postgresql.Driver
+  schema: public
+  loader:
+    # Enable only after the PostgreSQL connection above has been configured.
+    enabled: false
+    startup: true
+    cron: "0 30 3 * * *"
+    zone: Asia/Shanghai
+    source-schema: PUBLIC
+    # H2 is a single-file embedded database. Keep full-table reads serial by default.
+    source-read-threads: 1
+    # PostgreSQL-only constraint and index creation can still run in parallel.
+    target-threads: 4
+    batchSize: 1000
+    maxRetries: 3
+    blacklist: []
+
 loader:
-  enabled: true
+  # Oracle -> H2 was a one-time migration and is retained only as legacy code.
+  enabled: false
   cron: "0 30 2 * * *"
   threads: 4
   batchSize: 1000
@@ -31,6 +53,7 @@ backup:
 
 sample:
   loader:
+    enabled: false
     h2-url: jdbc:h2:./data-sample/h2db;MODE=Oracle;DATABASE_TO_UPPER=false;AUTO_SERVER=TRUE
     h2-username: sa
     h2-password: ""
