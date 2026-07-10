@@ -457,6 +457,82 @@ public class H2ToPostgresqlLoaderService {
             ConstraintDefinition primaryKey,
             List<ConstraintDefinition> uniqueConstraints
     ) throws SQLException {
+        Map<String, MutableIndex> indexes = fetchIndexesFromInformationSchema(connection, table);
+        if (indexes.isEmpty()) {
+            indexes = fetchIndexesFromJdbcMetadata(metadata, connection, table);
+        }
+
+        List<List<String>> constraintColumns = new ArrayList<>();
+        if (primaryKey != null) {
+            constraintColumns.add(primaryKey.columns());
+        }
+        uniqueConstraints.forEach(constraint -> constraintColumns.add(constraint.columns()));
+
+        List<IndexDefinition> result = new ArrayList<>();
+        for (MutableIndex index : indexes.values()) {
+            if (index.generated) {
+                continue;
+            }
+            List<IndexColumn> indexColumns = orderedValues(index.columns);
+            List<String> names = indexColumns.stream().map(IndexColumn::name).toList();
+            if (index.unique && constraintColumns.stream().anyMatch(names::equals)) {
+                continue;
+            }
+            result.add(new IndexDefinition(index.name, index.unique, indexColumns, index.filterCondition));
+        }
+        result.sort(Comparator.comparing(IndexDefinition::name));
+        return result;
+    }
+
+    private Map<String, MutableIndex> fetchIndexesFromInformationSchema(Connection connection, String table)
+            throws SQLException {
+        String sql = "SELECT I.INDEX_NAME, I.IS_GENERATED, IC.COLUMN_NAME, IC.ORDINAL_POSITION, " +
+                "IC.ORDERING_SPECIFICATION, IC.IS_UNIQUE " +
+                "FROM INFORMATION_SCHEMA.INDEXES I " +
+                "JOIN INFORMATION_SCHEMA.INDEX_COLUMNS IC " +
+                "ON I.INDEX_CATALOG = IC.INDEX_CATALOG " +
+                "AND I.INDEX_SCHEMA = IC.INDEX_SCHEMA " +
+                "AND I.INDEX_NAME = IC.INDEX_NAME " +
+                "AND I.TABLE_CATALOG = IC.TABLE_CATALOG " +
+                "AND I.TABLE_SCHEMA = IC.TABLE_SCHEMA " +
+                "AND I.TABLE_NAME = IC.TABLE_NAME " +
+                "WHERE I.TABLE_SCHEMA = ? AND I.TABLE_NAME = ? " +
+                "ORDER BY I.INDEX_NAME, IC.ORDINAL_POSITION";
+        Map<String, MutableIndex> indexes = new LinkedHashMap<>();
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, sourceSchema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String indexName = rs.getString("INDEX_NAME");
+                    String columnName = rs.getString("COLUMN_NAME");
+                    if (indexName == null || columnName == null) {
+                        continue;
+                    }
+                    MutableIndex index = indexes.computeIfAbsent(indexName, name -> new MutableIndex(
+                            name,
+                            rsBoolean(rs, "IS_UNIQUE"),
+                            null,
+                            rsBoolean(rs, "IS_GENERATED")
+                    ));
+                    index.columns.put(rs.getInt("ORDINAL_POSITION"), new IndexColumn(
+                            columnName,
+                            "DESC".equalsIgnoreCase(rs.getString("ORDERING_SPECIFICATION"))
+                    ));
+                }
+            }
+        } catch (SQLException ex) {
+            log.debug("Falling back to JDBC index metadata for {}.{}: {}", sourceSchema, table, ex.getMessage());
+            indexes.clear();
+        }
+        return indexes;
+    }
+
+    private Map<String, MutableIndex> fetchIndexesFromJdbcMetadata(
+            DatabaseMetaData metadata,
+            Connection connection,
+            String table
+    ) throws SQLException {
         Map<String, MutableIndex> indexes = new LinkedHashMap<>();
         try (ResultSet rs = metadata.getIndexInfo(connection.getCatalog(), sourceSchema, table, false, false)) {
             while (rs.next()) {
@@ -473,7 +549,8 @@ public class H2ToPostgresqlLoaderService {
                     index = new MutableIndex(
                             indexName,
                             !rsBoolean(rs, "NON_UNIQUE"),
-                            safeGetString(rs, "FILTER_CONDITION")
+                            safeGetString(rs, "FILTER_CONDITION"),
+                            false
                     );
                     indexes.put(indexName, index);
                 }
@@ -481,24 +558,7 @@ public class H2ToPostgresqlLoaderService {
                         new IndexColumn(columnName, "D".equalsIgnoreCase(rs.getString("ASC_OR_DESC"))));
             }
         }
-
-        List<List<String>> constraintColumns = new ArrayList<>();
-        if (primaryKey != null) {
-            constraintColumns.add(primaryKey.columns());
-        }
-        uniqueConstraints.forEach(constraint -> constraintColumns.add(constraint.columns()));
-
-        List<IndexDefinition> result = new ArrayList<>();
-        for (MutableIndex index : indexes.values()) {
-            List<IndexColumn> indexColumns = orderedValues(index.columns);
-            List<String> names = indexColumns.stream().map(IndexColumn::name).toList();
-            if (index.unique && constraintColumns.stream().anyMatch(names::equals)) {
-                continue;
-            }
-            result.add(new IndexDefinition(index.name, index.unique, indexColumns, index.filterCondition));
-        }
-        result.sort(Comparator.comparing(IndexDefinition::name));
-        return result;
+        return indexes;
     }
 
     private List<ForeignKeyDefinition> fetchForeignKeys(
@@ -786,6 +846,7 @@ public class H2ToPostgresqlLoaderService {
                     ? "CHAR(" + precision + ")" : "TEXT";
             case Types.VARCHAR, Types.NVARCHAR -> precision > 0 && precision <= POSTGRESQL_MAX_VARCHAR_LENGTH
                     ? "VARCHAR(" + precision + ")" : "TEXT";
+            case Types.JAVA_OBJECT, Types.OTHER -> "TEXT";
             default -> "TEXT";
         };
     }
@@ -931,6 +992,9 @@ public class H2ToPostgresqlLoaderService {
                 && column.typeName().toUpperCase(Locale.ROOT).contains("JSON")) {
             return new String(bytes, StandardCharsets.UTF_8);
         }
+        if (column.jdbcType() == Types.JAVA_OBJECT || column.jdbcType() == Types.OTHER) {
+            return value.toString();
+        }
         return value;
     }
 
@@ -983,6 +1047,10 @@ public class H2ToPostgresqlLoaderService {
         if (!h2TestTarget && column.typeName() != null
                 && column.typeName().toUpperCase(Locale.ROOT).contains("JSON")) {
             statement.setObject(index, value.toString(), Types.OTHER);
+            return;
+        }
+        if (column.jdbcType() == Types.JAVA_OBJECT || column.jdbcType() == Types.OTHER) {
+            statement.setString(index, value.toString());
             return;
         }
         statement.setObject(index, value);
@@ -1466,11 +1534,13 @@ public class H2ToPostgresqlLoaderService {
         private final boolean unique;
         private final Map<Integer, IndexColumn> columns = new LinkedHashMap<>();
         private final String filterCondition;
+        private final boolean generated;
 
-        private MutableIndex(String name, boolean unique, String filterCondition) {
+        private MutableIndex(String name, boolean unique, String filterCondition, boolean generated) {
             this.name = name;
             this.unique = unique;
             this.filterCondition = filterCondition;
+            this.generated = generated;
         }
     }
 
